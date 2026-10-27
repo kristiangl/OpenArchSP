@@ -53,6 +53,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Build DWG converter
+        run: cargo build --manifest-path dwg-helper/Cargo.toml --release
+
       - name: Read app version
         id: version
         shell: bash
@@ -81,16 +87,7 @@ jobs:
           python -m pip install . pyinstaller
 
       - name: Bundle application
-        run: >-
-          python -m PyInstaller
-          --noconfirm
-          --clean
-          --windowed
-          --name OpenArchSweptPaths
-          --paths src
-          --collect-all ezdxf
-          --collect-all shapely
-          src/openarchsp/app.py
+        run: python scripts/build_app.py
 
       - name: Install Inno Setup
         if: matrix.package == 'windows'

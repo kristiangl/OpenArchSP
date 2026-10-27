@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import ezdxf
@@ -15,6 +17,35 @@ from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsScene
 def read_dxf(path: str | Path) -> Drawing:
     """Read a DXF document from disk."""
     return ezdxf.readfile(str(path))
+
+
+def convert_dwg_to_dxf(source: str | Path, destination: str | Path) -> None:
+    """Convert DWG to DXF using the bundled acadrust helper."""
+    executable = "openarch-dwg-helper.exe" if sys.platform == "win32" else "openarch-dwg-helper"
+    if getattr(sys, "frozen", False):
+        helper = Path(sys._MEIPASS) / "openarchsp" / "bin" / executable
+    else:
+        helper = Path(__file__).resolve().parents[2] / "dwg-helper" / "target" / "release" / executable
+    if not helper.is_file():
+        raise RuntimeError(
+            "The DWG converter is missing. Rebuild the application with the Rust helper, "
+            "or run `cargo build --manifest-path dwg-helper/Cargo.toml --release`."
+        )
+    try:
+        result = subprocess.run(
+            [str(helper), str(source), str(destination)],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("DWG conversion timed out after 30 minutes.") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or f"DWG converter exited with code {result.returncode}.")
+    if not Path(destination).is_file():
+        raise RuntimeError("DWG converter completed without creating a DXF file.")
 
 
 def _xy(point: object) -> tuple[float, float]:

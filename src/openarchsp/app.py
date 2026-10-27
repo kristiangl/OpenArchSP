@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -39,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from openarchsp.drawing import draw_document, read_dxf
+from openarchsp.drawing import convert_dwg_to_dxf, draw_document, read_dxf
 from openarchsp.swept_path import polygons, swept_footprint
 from openarchsp.vehicles import (
     CUSTOM_RIGID_VEHICLE,
@@ -98,6 +99,8 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
         self.document = None
         self.drawing_path: Path | None = None
+        self._dwg_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._converted_base_path: Path | None = None
         self.route_points: list[tuple[float, float]] = []
         self.route_items: list[object] = []
         self.envelope_items: list[object] = []
@@ -117,7 +120,7 @@ class MainWindow(QMainWindow):
         self.units_spin.valueChanged.connect(self._vehicle_dimensions_changed)
 
         self.status = QStatusBar()
-        self.status.showMessage("Open a DXF site drawing to begin")
+        self.status.showMessage("Open a DXF or DWG site drawing to begin")
         self.setStatusBar(self.status)
         self._vehicle_selected()
 
@@ -191,7 +194,7 @@ class MainWindow(QMainWindow):
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
-        self.open_action = QAction("&Open DXF…", self)
+        self.open_action = QAction("&Open drawing…", self)
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
         self.open_action.triggered.connect(self.open_dxf)
         file_menu.addAction(self.open_action)
@@ -244,21 +247,36 @@ class MainWindow(QMainWindow):
             self,
             "Open site drawing",
             "",
-            "DXF drawings (*.dxf);;All files (*)",
+            "CAD drawings (*.dxf *.dwg);;DXF drawings (*.dxf);;DWG drawings (*.dwg);;All files (*)",
         )
         if filename:
-            self.load_dxf(filename)
+            self.load_drawing(filename)
 
-    def load_dxf(self, filename: str) -> None:
+    def load_drawing(self, filename: str) -> None:
+        path = Path(filename)
+        new_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        converted_path: Path | None = None
         try:
-            document = read_dxf(filename)
+            if path.suffix.lower() == ".dwg":
+                new_tempdir = tempfile.TemporaryDirectory(prefix="openarchsp-")
+                converted_path = Path(new_tempdir.name) / "imported.dxf"
+                convert_dwg_to_dxf(path, converted_path)
+                document = read_dxf(converted_path)
+            else:
+                document = read_dxf(path)
             count, _ = draw_document(document, self.view.scene)
         except Exception as error:
-            QMessageBox.critical(self, "Could not open DXF", str(error))
+            if new_tempdir:
+                new_tempdir.cleanup()
+            QMessageBox.critical(self, "Could not open drawing", str(error))
             return
 
+        if self._dwg_tempdir:
+            self._dwg_tempdir.cleanup()
+        self._dwg_tempdir = new_tempdir
+        self._converted_base_path = converted_path
         self.document = document
-        self.drawing_path = Path(filename)
+        self.drawing_path = path
         # draw_document() clears the scene, which also destroys existing overlay items.
         self.route_items.clear()
         self.envelope_items.clear()
@@ -273,12 +291,13 @@ class MainWindow(QMainWindow):
         self.draw_action.setEnabled(True)
         self.setWindowTitle(f"OpenArch Swept Paths — {self.drawing_path.name}")
         unit_text = (
-            "unitless DXF; assuming metres"
+            "unitless drawing; assuming metres"
             if unit_code == 0
-            else f"DXF unit code {unit_code}"
+            else f"drawing unit code {unit_code}"
         )
+        import_note = "DWG converted to temporary DXF" if converted_path else "DXF loaded"
         self.status.showMessage(
-            f"{self.drawing_path} · {count} entities rendered · {unit_text}"
+            f"{self.drawing_path} · {count} entities rendered · {unit_text} · {import_note}"
         )
         self.view.fit_drawing()
 
@@ -512,7 +531,7 @@ class MainWindow(QMainWindow):
         if self.drawing_path and Path(target).resolve() == self.drawing_path.resolve():
             raise ValueError("Choose a new output file so the source drawing is preserved.")
         if include_base and self.drawing_path:
-            output = read_dxf(self.drawing_path)
+            output = read_dxf(self._converted_base_path or self.drawing_path)
         else:
             output = ezdxf.new("R2010")
             if self.document is not None:
@@ -592,6 +611,12 @@ class MainWindow(QMainWindow):
             return
         result_type = "path and envelope preview" if self.envelope_geometry else "path"
         self.status.showMessage(f"Saved drawing copy with {result_type} to {target}")
+
+    def closeEvent(self, event: object) -> None:
+        if self._dwg_tempdir:
+            self._dwg_tempdir.cleanup()
+            self._dwg_tempdir = None
+        super().closeEvent(event)
 
 
 def main() -> None:

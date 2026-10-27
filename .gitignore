@@ -8,3 +8,4 @@ build/
 dist/
 release-output/
 packaging/windows/output/
+dwg-helper/target/
