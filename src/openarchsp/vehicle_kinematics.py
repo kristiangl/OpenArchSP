@@ -37,6 +37,18 @@ class VehicleUnitGeometry:
     def validate(self, *, has_predecessor: bool) -> None:
         if not self.name.strip():
             raise ValueError("Every vehicle unit needs a name.")
+        numeric_values = (
+            self.width_m,
+            self.front_extent_m,
+            self.rear_extent_m,
+            self.track_m,
+            self.front_hitch_m,
+            self.rear_hitch_m,
+            self.hitch_width_m,
+            *self.axle_offsets_m,
+        )
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError(f"{self.name}: geometry values must be finite numbers.")
         if min(
             self.width_m,
             self.front_extent_m,
@@ -102,26 +114,37 @@ class CombinationGeometry:
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> "CombinationGeometry":
         raw_units = value.get("units")
-        if not isinstance(raw_units, list) or not raw_units:
+        if not isinstance(raw_units, (list, tuple)) or not raw_units:
             raise ValueError("Geometry JSON must contain a non-empty 'units' list.")
-        units = tuple(
-            VehicleUnitGeometry(
-                name=str(raw["name"]),
-                width_m=float(raw["width_m"]),
-                front_extent_m=float(raw["front_extent_m"]),
-                rear_extent_m=float(raw["rear_extent_m"]),
-                axle_offsets_m=tuple(float(offset) for offset in raw["axle_offsets_m"]),
-                track_m=float(raw["track_m"]),
-                front_hitch_m=float(raw.get("front_hitch_m", 0.0)),
-                rear_hitch_m=float(raw.get("rear_hitch_m", 0.0)),
-                hitch_width_m=float(raw.get("hitch_width_m", 0.25)),
+        steer_axle_m = float(value["steer_axle_m"])
+        units_list: list[VehicleUnitGeometry] = []
+        for index, raw in enumerate(raw_units):
+            axle_offsets = [float(offset) for offset in raw["axle_offsets_m"]]
+            if index == 0 and not any(
+                math.isclose(offset, steer_axle_m, abs_tol=1e-6)
+                for offset in axle_offsets
+            ):
+                # Older profiles kept the steering station separately and omitted it
+                # from axle traces. Add it during load so it is tracked as an axle.
+                axle_offsets.append(steer_axle_m)
+            units_list.append(
+                VehicleUnitGeometry(
+                    name=str(raw["name"]),
+                    width_m=float(raw["width_m"]),
+                    front_extent_m=float(raw["front_extent_m"]),
+                    rear_extent_m=float(raw["rear_extent_m"]),
+                    axle_offsets_m=tuple(axle_offsets),
+                    track_m=float(raw["track_m"]),
+                    front_hitch_m=float(raw.get("front_hitch_m", 0.0)),
+                    rear_hitch_m=float(raw.get("rear_hitch_m", 0.0)),
+                    hitch_width_m=float(raw.get("hitch_width_m", 0.25)),
+                )
             )
-            for raw in raw_units
-        )
+        units = tuple(units_list)
         result = cls(
             name=str(value.get("name", "Vehicle combination")),
             units=units,
-            steer_axle_m=float(value["steer_axle_m"]),
+            steer_axle_m=steer_axle_m,
             max_steer_deg=float(value.get("max_steer_deg", 35.0)),
             max_articulation_deg=float(value.get("max_articulation_deg", 70.0)),
             source_reference=str(value.get("source_reference", "User-defined; verify dimensions")),
@@ -132,6 +155,15 @@ class CombinationGeometry:
     def validate(self) -> None:
         if not self.units:
             raise ValueError("A vehicle combination must have at least one unit.")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.steer_axle_m,
+                self.max_steer_deg,
+                self.max_articulation_deg,
+            )
+        ):
+            raise ValueError("Steering and articulation parameters must be finite numbers.")
         if self.steer_axle_m <= 0 or self.steer_axle_m >= self.units[0].front_extent_m:
             raise ValueError("The lead steer axle must be ahead of its rear axle and inside the body.")
         if not 0 < self.max_steer_deg < 90:
@@ -140,6 +172,11 @@ class CombinationGeometry:
             raise ValueError("Maximum articulation angle must be between 0 and 180 degrees.")
         for index, unit in enumerate(self.units):
             unit.validate(has_predecessor=index > 0)
+        if not any(
+            math.isclose(offset, self.steer_axle_m, abs_tol=1e-6)
+            for offset in self.units[0].axle_offsets_m
+        ):
+            raise ValueError("Include the lead steer axle station in the first unit's axle list.")
 
 
 @dataclass(frozen=True)
@@ -608,13 +645,24 @@ def simulate_combination(
             axle_points: list[Point] = []
             left_wheels: list[Point] = []
             right_wheels: list[Point] = []
-            for (reference, heading), sample in zip(poses, samples):
+            path_segment = 0
+            for reference, heading in poses:
                 axle_center = _add(reference, _scale(_unit(heading), offset))
                 axle_points.append(axle_center)
                 normal = _normal(heading)
                 left_wheels.append(_add(axle_center, _scale(normal, unit.track_m / 2)))
                 right_wheels.append(_sub(axle_center, _scale(normal, unit.track_m / 2)))
-                relative = _dot(_sub(axle_center, sample.point), _normal(sample.heading_rad))
+                projection, _progress, path_segment, _error = _project_onto_path(
+                    axle_center, samples, path_segment
+                )
+                path_start = samples[path_segment].point
+                path_end = samples[path_segment + 1].point
+                path_delta = _sub(path_end, path_start)
+                path_length = max(math.hypot(*path_delta), 1e-9)
+                relative = (
+                    path_delta[0] * (axle_center[1] - projection[1])
+                    - path_delta[1] * (axle_center[0] - projection[0])
+                ) / path_length
                 offtracking[key] = max(offtracking.get(key, 0.0), abs(relative))
             axle_traces[key] = tuple(axle_points)
             wheel_traces[f"{key} left wheel"] = tuple(left_wheels)

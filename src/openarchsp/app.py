@@ -36,16 +36,20 @@ from PySide6.QtWidgets import (
     QGraphicsPathItem,
     QGraphicsScene,
     QGraphicsView,
+    QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QPlainTextEdit,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
+    QHBoxLayout,
 )
 
 from openarchsp.drawing import convert_dwg_to_dxf, draw_document, read_dxf
@@ -118,7 +122,7 @@ class DrawingView(QGraphicsView):
 
 
 class GeometryDialog(QDialog):
-    """Edit an explicit axle/coupling profile without baking guesses into presets."""
+    """Edit a tractor/trailer assembly and its axle and coupling stations."""
 
     EXAMPLE = {
         "name": "Example combination (edit to match the actual vehicle)",
@@ -132,7 +136,7 @@ class GeometryDialog(QDialog):
                 "width_m": 2.5,
                 "front_extent_m": 5.5,
                 "rear_extent_m": 0.9,
-                "axle_offsets_m": [3.8, 0.0, -1.3],
+                "axle_offsets_m": [3.8, 0.65, -0.65],
                 "track_m": 2.0,
                 "rear_hitch_m": 0.5,
             },
@@ -141,7 +145,7 @@ class GeometryDialog(QDialog):
                 "width_m": 2.5,
                 "front_extent_m": 9.6,
                 "rear_extent_m": 3.3,
-                "axle_offsets_m": [0.0, -1.3, -2.6],
+                "axle_offsets_m": [1.3, 0.0, -1.3],
                 "track_m": 2.0,
                 "front_hitch_m": 9.6,
             },
@@ -156,24 +160,82 @@ class GeometryDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Vehicle geometry — {vehicle_name}")
-        self.resize(700, 620)
+        self.resize(1240, 700)
         self.geometry: CombinationGeometry | None = None
         layout = QVBoxLayout(self)
         help_label = QLabel(
-            "Enter one lead unit and any number of trailers. Distances are metres, "
-            "measured from each unit's rearmost axle group; positive axle offsets are "
-            "forward. Hitch offsets are measured to the axle group. The example values "
-            "are illustrative only: replace them with verified vehicle dimensions. "
-            "A trailing unit needs front_hitch_m; a towing unit needs rear_hitch_m. "
-            "A rear_hitch_m value is positive behind the axle group and negative ahead."
+            "Add the lead tractor first, then trailers and dollies in towing order. All "
+            "distances are metres from each unit's rearmost axle-group centre; axle "
+            "stations are comma-separated and positive forward. Front coupling is "
+            "positive forward; rear coupling is positive behind the axle group and "
+            "negative ahead. Check every station against the vehicle drawing."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
-        self.editor = QPlainTextEdit()
-        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+
         data = existing.to_dict() if existing else self.EXAMPLE
-        self.editor.setPlainText(json.dumps(data, indent=2))
-        layout.addWidget(self.editor)
+        settings = QFormLayout()
+        self.name_edit = QLineEdit(str(data.get("name", vehicle_name)))
+        self.steer_axle_spin = self._spin(float(data.get("steer_axle_m", 3.8)), 100.0)
+        self.max_steer_spin = self._spin(float(data.get("max_steer_deg", 35.0)), 89.0)
+        self.max_articulation_spin = self._spin(
+            float(data.get("max_articulation_deg", 70.0)), 179.0
+        )
+        self.source_edit = QLineEdit(str(data.get("source_reference", "User-defined")))
+        settings.addRow("Combination", self.name_edit)
+        settings.addRow("Lead steer axle station (m)", self.steer_axle_spin)
+        settings.addRow("Maximum centre road-wheel angle (°)", self.max_steer_spin)
+        settings.addRow("Maximum articulation (°)", self.max_articulation_spin)
+        settings.addRow("Source / notes", self.source_edit)
+        layout.addLayout(settings)
+
+        self.units_table = QTableWidget(0, 9)
+        self.units_table.setHorizontalHeaderLabels(
+            (
+                "Component",
+                "Width (m)",
+                "Front extent (m)",
+                "Rear extent (m)",
+                "Axle stations from group centre (m, CSV)",
+                "Track (m)",
+                "Front coupling (m)",
+                "Rear coupling (m)",
+                "Hitch width (m)",
+            )
+        )
+        self.units_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.units_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.units_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.units_table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.units_table, 1)
+        raw_units = data.get("units", [])
+        if isinstance(raw_units, (list, tuple)):
+            for unit in raw_units:
+                if isinstance(unit, dict):
+                    self._append_unit(unit)
+
+        unit_actions = QHBoxLayout()
+        for label, callback in (
+            ("Add tractor", self._add_tractor),
+            ("Add trailer", self._add_trailer),
+            ("Add converter dolly", self._add_dolly),
+            ("Add axle station", self._add_axle),
+            ("Remove axle station", self._remove_axle),
+            ("Remove component", self._remove_unit),
+            ("Move up", lambda: self._move_unit(-1)),
+            ("Move down", lambda: self._move_unit(1)),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            unit_actions.addWidget(button)
+        unit_actions.addStretch(1)
+        layout.addLayout(unit_actions)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -181,11 +243,171 @@ class GeometryDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    @staticmethod
+    def _spin(value: float, maximum: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(0.01, maximum)
+        spin.setDecimals(2)
+        spin.setSingleStep(0.1)
+        spin.setValue(value)
+        return spin
+
+    def _append_unit(self, data: dict[str, object], row: int | None = None) -> None:
+        row = self.units_table.rowCount() if row is None else row
+        self.units_table.insertRow(row)
+        values = (
+            data.get("name", "Vehicle unit"),
+            data.get("width_m", 2.5),
+            data.get("front_extent_m", 5.0),
+            data.get("rear_extent_m", 1.0),
+            ", ".join(str(value) for value in data.get("axle_offsets_m", [0.0])),
+            data.get("track_m", 2.0),
+            data.get("front_hitch_m", 0.0),
+            data.get("rear_hitch_m", 0.0),
+            data.get("hitch_width_m", 0.25),
+        )
+        for column, value in enumerate(values):
+            self.units_table.setItem(row, column, QTableWidgetItem(str(value)))
+
+    def _add_tractor(self) -> None:
+        self._append_unit(
+            {
+                "name": "Prime mover",
+                "width_m": 2.5,
+                "front_extent_m": 5.5,
+                "rear_extent_m": 0.9,
+                "axle_offsets_m": [3.8, 0.65, -0.65],
+                "track_m": 2.0,
+                "rear_hitch_m": 0.5,
+            },
+            0,
+        )
+        self.units_table.selectRow(0)
+
+    def _add_trailer(self) -> None:
+        row = self.units_table.rowCount()
+        self._append_unit(
+            {
+                "name": f"Trailer {max(1, row)}",
+                "width_m": 2.5,
+                "front_extent_m": 9.6,
+                "rear_extent_m": 3.3,
+                "axle_offsets_m": [1.3, 0.0, -1.3],
+                "track_m": 2.0,
+                "front_hitch_m": 9.6,
+            }
+        )
+        self.units_table.selectRow(self.units_table.rowCount() - 1)
+
+    def _add_dolly(self) -> None:
+        self._append_unit(
+            {
+                "name": "Converter dolly",
+                "width_m": 2.5,
+                "front_extent_m": 1.4,
+                "rear_extent_m": 0.7,
+                "axle_offsets_m": [0.65, -0.65],
+                "track_m": 2.0,
+                "front_hitch_m": 1.4,
+                "rear_hitch_m": 5.0,
+                "hitch_width_m": 0.3,
+            }
+        )
+        self.units_table.selectRow(self.units_table.rowCount() - 1)
+
+    def _add_axle(self) -> None:
+        row = self.units_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select a component", "Select a tractor, trailer or dolly first.")
+            return
+        station, accepted = QInputDialog.getDouble(
+            self,
+            "Add axle station",
+            "Distance from rearmost axle-group centre (m; positive forward):",
+            0.0,
+            -100.0,
+            100.0,
+            2,
+        )
+        if not accepted:
+            return
+        stations = self.units_table.item(row, 4).text().strip()
+        self.units_table.item(row, 4).setText(
+            f"{stations}, {station:.2f}" if stations else f"{station:.2f}"
+        )
+
+    def _remove_axle(self) -> None:
+        row = self.units_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Select a component", "Select a component before removing an axle.")
+            return
+        stations = [
+            value.strip()
+            for value in self.units_table.item(row, 4).text().split(",")
+            if value.strip()
+        ]
+        if not stations:
+            return
+        selected, accepted = QInputDialog.getItem(
+            self, "Remove axle station", "Choose station to remove:", stations, 0, False
+        )
+        if accepted:
+            stations.remove(selected)
+            self.units_table.item(row, 4).setText(", ".join(stations))
+
+    def _remove_unit(self) -> None:
+        row = self.units_table.currentRow()
+        if row >= 0:
+            self.units_table.removeRow(row)
+
+    def _move_unit(self, delta: int) -> None:
+        row = self.units_table.currentRow()
+        target = row + delta
+        if row < 0 or not 0 <= target < self.units_table.rowCount():
+            return
+        values = [
+            self.units_table.item(row, column).text()
+            for column in range(self.units_table.columnCount())
+        ]
+        self.units_table.removeRow(row)
+        self.units_table.insertRow(target)
+        for column, value in enumerate(values):
+            self.units_table.setItem(target, column, QTableWidgetItem(value))
+        self.units_table.selectRow(target)
+
     def _accept_geometry(self) -> None:
         try:
-            data = json.loads(self.editor.toPlainText())
+            units: list[dict[str, object]] = []
+            for row in range(self.units_table.rowCount()):
+                item = lambda column: self.units_table.item(row, column).text().strip()
+                axle_offsets = tuple(
+                    float(value.strip())
+                    for value in item(4).split(",")
+                    if value.strip()
+                )
+                units.append(
+                    {
+                        "name": item(0),
+                        "width_m": float(item(1)),
+                        "front_extent_m": float(item(2)),
+                        "rear_extent_m": float(item(3)),
+                        "axle_offsets_m": axle_offsets,
+                        "track_m": float(item(5)),
+                        "front_hitch_m": float(item(6)),
+                        "rear_hitch_m": float(item(7)),
+                        "hitch_width_m": float(item(8)),
+                    }
+                )
+            data = {
+                "name": self.name_edit.text().strip(),
+                "steer_axle_m": self.steer_axle_spin.value(),
+                "max_steer_deg": self.max_steer_spin.value(),
+                "max_articulation_deg": self.max_articulation_spin.value(),
+                "source_reference": self.source_edit.text().strip(),
+                "units": units,
+            }
             self.geometry = CombinationGeometry.from_dict(data)
-        except (ValueError, TypeError, KeyError, AttributeError) as error:
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError) as error:
             QMessageBox.warning(self, "Invalid vehicle geometry", str(error))
             return
         self.accept()

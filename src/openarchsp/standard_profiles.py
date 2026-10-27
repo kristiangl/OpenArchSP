@@ -68,7 +68,6 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
     triple_13 = (1.3, 0.0, -1.3)
     triple_125 = (1.25, 0.0, -1.25)
     tandem_13 = (0.65, -0.65)
-    tandem_10 = (0.5, -0.5)
 
     profiles = {
         "passenger-vehicle-5-2": _profile(
@@ -79,7 +78,7 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     1.94,
                     4.25,
                     0.95,
-                    (0.0,),
+                    (3.05, 0.0),
                     1.84,
                 ),
             ),
@@ -133,7 +132,7 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     1.94,
                     4.25,
                     0.95,
-                    (0.0,),
+                    (3.05, 0.0),
                     1.84,
                     rear_hitch_m=1.15,
                 ),
@@ -157,7 +156,7 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=6.9,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(5.3, *tandem_13),
                     rear_hitch=-0.2,
                 ),
                 _unit(
@@ -178,7 +177,7 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=7.0,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(5.4, *tandem_13),
                     rear_hitch=-0.4,
                 ),
                 _unit(
@@ -199,13 +198,13 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=5.0,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(4.0, *tandem_13),
                     rear_hitch=-0.4,
                 ),
                 _unit(
                     "Lead semi-trailer",
                     front=7.9,
-                    rear=0.2,
+                    rear=1.3,
                     axles=triple_13,
                     front_hitch=7.9,
                     rear_hitch=0.2,
@@ -228,12 +227,12 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=5.9,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(4.5, *tandem_13),
                 ),
                 _unit(
                     "Lead semi-trailer",
                     front=7.6,
-                    rear=0.45,
+                    rear=1.3,
                     axles=triple_13,
                     front_hitch=7.6,
                     rear_hitch=0.45,
@@ -256,13 +255,13 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=6.5,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(5.0, *tandem_13),
                     rear_hitch=0.37,
                 ),
                 _unit(
                     "Lead semi-trailer",
                     front=7.3,
-                    rear=0.1,
+                    rear=1.25,
                     axles=triple_125,
                     front_hitch=7.3,
                     rear_hitch=0.1,
@@ -270,7 +269,7 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                 _unit(
                     "Middle semi-trailer",
                     front=7.3,
-                    rear=0.1,
+                    rear=1.25,
                     axles=triple_125,
                     front_hitch=7.3,
                     rear_hitch=0.1,
@@ -293,13 +292,13 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=7.1,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(5.5, *tandem_13),
                     rear_hitch=-0.3,
                 ),
                 _unit(
                     "Lead A-trailer",
                     front=9.5,
-                    rear=1.2,
+                    rear=1.3,
                     axles=triple_13,
                     front_hitch=9.5,
                     rear_hitch=1.2,
@@ -331,13 +330,13 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                     "Prime mover",
                     front=7.1,
                     rear=0.9,
-                    axles=tandem_13,
+                    axles=(5.5, *tandem_13),
                     rear_hitch=-0.3,
                 ),
                 _unit(
                     "Lead A-trailer",
                     front=9.5,
-                    rear=1.2,
+                    rear=1.3,
                     axles=triple_13,
                     front_hitch=9.5,
                     rear_hitch=1.2,
@@ -354,7 +353,7 @@ def standard_vehicle_geometries() -> dict[str, CombinationGeometry]:
                 _unit(
                     "Middle A-trailer",
                     front=9.5,
-                    rear=1.2,
+                    rear=1.3,
                     axles=triple_13,
                     front_hitch=9.5,
                     rear_hitch=1.2,
