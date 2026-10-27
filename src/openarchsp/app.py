@@ -221,6 +221,7 @@ class MainWindow(QMainWindow):
         self.simulation_result: SimulationResult | None = None
         self.simulation_scale = 1.0
         self.vehicle_geometries = self._load_vehicle_geometries()
+        self._last_vehicle_geometry_mode: bool | None = None
 
         self.vehicle_definitions = self._load_vehicle_definitions()
         self.view = DrawingView()
@@ -484,6 +485,13 @@ class MainWindow(QMainWindow):
     def _vehicle_selected(self, _index: int = 0) -> None:
         vehicle = self._selected_vehicle()
         has_geometry = vehicle.id in self.vehicle_geometries
+        if (
+            self._last_vehicle_geometry_mode is not None
+            and self._last_vehicle_geometry_mode != has_geometry
+            and self.route_points
+        ):
+            self.clear_route()
+        self._last_vehicle_geometry_mode = has_geometry
         if hasattr(self, "draw_action"):
             self.draw_action.setText(
                 "Draw steer-axle path" if has_geometry else "Draw reference path"
