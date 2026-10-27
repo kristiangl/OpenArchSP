@@ -8,6 +8,7 @@ tyre forces, suspension, load transfer, or high-speed transient behaviour.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from collections.abc import Sequence
 
@@ -153,6 +154,7 @@ class UnitTrajectory:
 class SimulationResult:
     envelope: BaseGeometry
     steer_axle_path: tuple[Point, ...]
+    target_steer_axle_path: tuple[Point, ...]
     steering_angles_deg: tuple[float, ...]
     units: tuple[UnitTrajectory, ...]
     offtracking_by_axle_m: dict[str, float]
@@ -161,6 +163,9 @@ class SimulationResult:
     front_wheel_angles_deg: tuple[tuple[float, float], ...]
     max_steering_rate_deg_s: float
     allowed_steering_rate_deg_s: float
+    steering_rate_saturated: bool
+    maximum_path_error_m: float
+    path_complete: bool
 
 
 def _unit(angle: float) -> Point:
@@ -320,6 +325,56 @@ def smooth_steer_axle_path(
     return tuple(samples)
 
 
+def _wrap_angle(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def _project_onto_path(
+    point: Point, samples: Sequence[RouteSample], start_segment: int
+) -> tuple[Point, float, int, float]:
+    """Project onto a forward window of path segments for monotonic driver tracking."""
+    first = max(0, start_segment - 2)
+    last = min(len(samples) - 1, start_segment + 64)
+    best_point = samples[first].point
+    best_distance = math.inf
+    best_progress = samples[first].distance_m
+    best_segment = first
+    for index in range(first, last):
+        start, end = samples[index].point, samples[index + 1].point
+        delta = _sub(end, start)
+        length_squared = _dot(delta, delta)
+        fraction = min(1.0, max(0.0, _dot(_sub(point, start), delta) / length_squared))
+        candidate = _add(start, _scale(delta, fraction))
+        distance = math.dist(candidate, point)
+        if distance < best_distance:
+            best_point = candidate
+            best_distance = distance
+            best_progress = samples[index].distance_m + fraction * (
+                samples[index + 1].distance_m - samples[index].distance_m
+            )
+            best_segment = index
+    return best_point, best_progress, best_segment, best_distance
+
+
+def _point_at_distance(
+    distance: float,
+    samples: Sequence[RouteSample],
+    distances: Sequence[float],
+) -> Point:
+    if distance <= 0:
+        return samples[0].point
+    if distance >= distances[-1]:
+        return samples[-1].point
+    index = min(len(samples) - 2, bisect_right(distances, distance) - 1)
+    start, end = samples[index], samples[index + 1]
+    span = end.distance_m - start.distance_m
+    fraction = (distance - start.distance_m) / span
+    return (
+        start.point[0] + (end.point[0] - start.point[0]) * fraction,
+        start.point[1] + (end.point[1] - start.point[1]) * fraction,
+    )
+
+
 def _rectangle(reference: Point, heading: float, unit: VehicleUnitGeometry) -> Polygon:
     forward = _unit(heading)
     side = _normal(heading)
@@ -334,15 +389,6 @@ def _rectangle(reference: Point, heading: float, unit: VehicleUnitGeometry) -> P
     return Polygon(corners)
 
 
-def _unit_pose_for_lead(
-    sample: RouteSample, steering_angle: float, geometry: CombinationGeometry
-) -> tuple[Point, float]:
-    heading = sample.heading_rad - steering_angle
-    steer_point = sample.point
-    rear_axle = _sub(steer_point, _scale(_unit(heading), geometry.steer_axle_m))
-    return rear_axle, heading
-
-
 def simulate_combination(
     route: Sequence[Point],
     geometry: CombinationGeometry,
@@ -353,40 +399,95 @@ def simulate_combination(
     lock_to_lock_s: float = 6.0,
     max_poses: int = 60_000,
 ) -> SimulationResult:
-    """Simulate a forward, low-speed combination along the steer-axle path.
+    """Simulate a forward combination with rate-limited steer-axle path following.
 
-    The lead unit is reconstructed from the steer-axle route and the bicycle
-    kinematic relation. Towed units follow their front couplings with a
-    no-lateral-slip rear axle constraint. This supports arbitrary trailer count.
+    The lead unit uses a bicycle model and pure-pursuit driver. Its road-wheel
+    steering angle changes at the configured lock-to-lock rate, so the actual
+    steer-axle path can deviate from the rounded target path. Towed units follow
+    their front couplings with a no-lateral-slip rear axle constraint.
     """
     geometry.validate()
     if speed_kmh <= 0 or lock_to_lock_s <= 0:
         raise ValueError("Speed and steering lock-to-lock time must be positive.")
-    samples = smooth_steer_axle_path(route, corner_radius_m, spacing_m)
-    if len(samples) > max_poses:
+    target_samples = smooth_steer_axle_path(route, corner_radius_m, spacing_m)
+    if len(target_samples) > max_poses:
         raise ValueError("This path exceeds the simulation pose limit; increase sampling spacing.")
 
     lead = geometry.units[0]
-    steering: list[float] = [0.0]
-    for previous, current in zip(samples, samples[1:]):
-        ds = current.distance_m - previous.distance_m
-        curvature = (previous.curvature_per_m + current.curvature_per_m) / 2
-        angle = steering[-1]
+    speed = speed_kmh / 3.6
+    dt = min(0.05, spacing_m / speed)
+    maximum_steer = math.radians(geometry.max_steer_deg)
+    maximum_steer_rate = 2 * maximum_steer / lock_to_lock_s
+    lookahead = max(2.0, 1.5 * geometry.steer_axle_m)
+    target_distances = [sample.distance_m for sample in target_samples]
+    total_target_length = target_distances[-1]
 
-        def derivative(value: float) -> float:
-            return curvature - math.sin(value) / geometry.steer_axle_m
+    heading = target_samples[0].heading_rad
+    steering_angle = 0.0
+    rear_axle = _sub(target_samples[0].point, _scale(_unit(heading), geometry.steer_axle_m))
+    lead_poses: list[tuple[Point, float]] = [(rear_axle, heading)]
+    steering: list[float] = [steering_angle]
+    steer_points: list[Point] = [target_samples[0].point]
+    actual_distances: list[float] = [0.0]
+    progress = 0.0
+    path_segment = 0
+    maximum_path_error = 0.0
+    path_complete = False
+    steering_rate_saturated = False
+    maximum_duration = max(60.0, total_target_length / speed * 4 + 30.0)
+    maximum_steps = min(max_poses - 1, math.ceil(maximum_duration / dt))
 
-        k1 = derivative(angle)
-        k2 = derivative(angle + ds * k1 / 2)
-        k3 = derivative(angle + ds * k2 / 2)
-        k4 = derivative(angle + ds * k3)
-        angle += ds * (k1 + 2 * k2 + 2 * k3 + k4) / 6
-        if abs(angle) > math.radians(geometry.max_steer_deg):
-            raise ValueError(
-                f"The steer-axle path needs more than {geometry.max_steer_deg:.1f}° steering. "
-                "Increase the corner radius or adjust the vehicle geometry."
-            )
-        steering.append(angle)
+    for _step in range(maximum_steps):
+        front = _add(rear_axle, _scale(_unit(heading), geometry.steer_axle_m))
+        _projected, projected_s, path_segment, path_error = _project_onto_path(
+            front, target_samples, path_segment
+        )
+        progress = max(progress, projected_s)
+        maximum_path_error = max(maximum_path_error, path_error)
+        distance_to_end = math.dist(front, target_samples[-1].point)
+        if progress >= total_target_length - spacing_m and distance_to_end <= max(0.5, 2 * spacing_m):
+            path_complete = True
+            break
+
+        target_s = min(total_target_length, progress + lookahead)
+        aim = _point_at_distance(target_s, target_samples, target_distances)
+        chord = _sub(aim, front)
+        chord_length = max(math.hypot(*chord), 0.1)
+        front_course = heading + steering_angle
+        aim_angle = math.atan2(chord[1], chord[0])
+        heading_error = _wrap_angle(aim_angle - front_course)
+        desired_curvature = 2 * math.sin(heading_error) / chord_length
+        curvature_rate = speed / max(math.cos(steering_angle), 1e-4) * (
+            desired_curvature - math.sin(steering_angle) / geometry.steer_axle_m
+        )
+        if abs(curvature_rate) > maximum_steer_rate:
+            steering_rate_saturated = True
+        steering_rate = min(max(curvature_rate, -maximum_steer_rate), maximum_steer_rate)
+        next_steering = min(
+            maximum_steer,
+            max(-maximum_steer, steering_angle + steering_rate * dt),
+        )
+
+        mid_steering = (steering_angle + next_steering) / 2
+        yaw_rate = speed / geometry.steer_axle_m * math.tan(mid_steering)
+        mid_heading = heading + yaw_rate * dt / 2
+        next_rear_axle = _add(rear_axle, _scale(_unit(mid_heading), speed * dt))
+        next_heading = heading + yaw_rate * dt
+        next_front = _add(next_rear_axle, _scale(_unit(next_heading), geometry.steer_axle_m))
+        actual_distances.append(actual_distances[-1] + math.dist(steer_points[-1], next_front))
+        steer_points.append(next_front)
+        lead_poses.append((next_rear_axle, next_heading))
+        steering.append(next_steering)
+        rear_axle, heading, steering_angle = next_rear_axle, next_heading, next_steering
+
+    samples = tuple(
+        RouteSample(point, body_heading + angle, 0.0, distance)
+        for point, (_rear, body_heading), angle, distance in zip(
+            steer_points, lead_poses, steering, actual_distances
+        )
+    )
+    if len(samples) > max_poses:
+        raise ValueError("This path exceeds the simulation pose limit; increase sampling spacing.")
 
     front_wheel_angles: list[tuple[float, float]] = []
     for angle in steering:
@@ -407,24 +508,17 @@ def simulate_combination(
         )
         front_wheel_angles.append((math.degrees(left_angle), math.degrees(right_angle)))
 
-    simulation_speed_m_s = speed_kmh / 3.6
     max_steer_rate = max(
         (
             abs(steering[index + 1] - steering[index])
-            / (samples[index + 1].distance_m - samples[index].distance_m)
-            * simulation_speed_m_s
+            / dt
             * 180
             / math.pi
             for index in range(len(steering) - 1)
         ),
         default=0.0,
     )
-    allowed_steer_rate = 2 * geometry.max_steer_deg / lock_to_lock_s
-
-    lead_poses = [
-        _unit_pose_for_lead(sample, angle, geometry)
-        for sample, angle in zip(samples, steering)
-    ]
+    allowed_steer_rate = math.degrees(maximum_steer_rate)
     all_poses: list[list[tuple[Point, float]]] = [lead_poses]
     articulation_values: list[list[float]] = [[0.0] * len(samples)]
 
@@ -519,6 +613,7 @@ def simulate_combination(
     return SimulationResult(
         envelope,
         tuple(sample.point for sample in samples),
+        tuple(sample.point for sample in target_samples),
         tuple(math.degrees(value) for value in steering),
         tuple(trajectories),
         offtracking,
@@ -527,4 +622,7 @@ def simulate_combination(
         tuple(front_wheel_angles),
         max_steer_rate,
         allowed_steer_rate,
+        steering_rate_saturated,
+        maximum_path_error,
+        path_complete,
     )

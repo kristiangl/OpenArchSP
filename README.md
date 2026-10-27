@@ -28,9 +28,9 @@ The initial Austroads catalogue includes passenger vehicle, service vehicle, tru
 
 ## Model limits
 
-Configured profiles use a forward, low-speed, no-lateral-slip kinematic model. It calculates lead-unit steering angles (including inside/outside front wheel angles), trailer motion through arbitrary coupling chains, axle and wheel trajectories, body envelopes, articulation, and axle off-tracking. Speed and steering lock-to-lock settings are used to report the steering rate required to stay on the drawn steer-axle path; the app flags when that rate exceeds the setting.
+Configured profiles use a forward, low-speed, no-lateral-slip kinematic model with a pure-pursuit driver and rate-limited steering. It calculates inside/outside front wheel angles, trailer motion through coupling chains, axle and wheel trajectories, body envelopes, articulation, and axle off-tracking. It displays the target and actual steer-axle paths, reports path error, and flags steering saturation or an incomplete turn.
 
-This is the first kinematic milestone, not a complete vehicle dynamics or PBS assessment tool. It does not yet model tyre forces, load transfer, high-speed transient response, reverse manoeuvres, or steering-rate-induced deviation from the prescribed steer-axle path. The catalogue currently contains Austroads overall lengths, but not a verified axle/coupling geometry profile for every vehicle. Profiles can be entered and saved locally; the example geometry in the editor is illustrative and must be replaced with vehicle-specific dimensions before design use. Austroads describes its design-vehicle library, turning templates and software parameters in [AP-G34-23](https://austroads.gov.au/publications/road-design/ap-g34); NHVR's [PBS standards](https://wws.nhvr.gov.au/road-access/performance-based-standards/the-standards) define additional assessment measures and model verification requirements.
+This is the first kinematic milestone, not a complete vehicle dynamics or PBS assessment tool. It does not yet model tyre forces, load transfer, high-speed transient response, or reverse manoeuvres. The catalogue currently contains Austroads overall lengths, but not a verified axle/coupling geometry profile for every vehicle. Profiles can be entered and saved locally; the example geometry in the editor is illustrative and must be replaced with vehicle-specific dimensions before design use. Austroads describes its design-vehicle library, turning templates and software parameters in [AP-G34-23](https://austroads.gov.au/publications/road-design/ap-g34); NHVR's [PBS standards](https://wws.nhvr.gov.au/road-access/performance-based-standards/the-standards) define additional assessment measures and model verification requirements.
 
 The drawing viewer currently renders model-space LINE, LWPOLYLINE, POLYLINE, CIRCLE and ARC entities. Paper space, blocks, text and other entity types are not yet displayed.
 
@@ -52,7 +52,7 @@ On macOS or Linux, activate the environment with source .venv/bin/activate.
 ## Roadmap
 
 - Populate the vehicle catalogue with verified Austroads axle, body and coupling geometry.
-- Add steering-actuator and driver path-following dynamics, including route deviation when the requested path cannot be followed.
+- Calibrate the path-following controller against Austroads paths and support measured steering behaviour for different vehicle classes.
 - Add reverse manoeuvres, turning animations, clearance checks and printable simulation reports.
 - Validate profiles and outputs against Austroads templates and jurisdictional requirements before design use.
 - Broader CAD entity rendering and DWG conversion fidelity.

@@ -519,7 +519,8 @@ class MainWindow(QMainWindow):
                 "Simulation uses this explicit axle and coupling geometry. "
                 "Check the profile against the actual design-vehicle drawing. "
                 f"Source: {self.vehicle_geometries[vehicle.id].source_reference}. "
-                "The reported steering rate is the rate needed to follow the input path."
+                "The solver rate-limits steering; compare the target and actual paths "
+                "and watch for saturation."
             )
         elif vehicle.supports_preview:
             self.vehicle_note_label.setText(
@@ -726,17 +727,20 @@ class MainWindow(QMainWindow):
                     default=0.0,
                 )
                 max_offtracking = max(result.offtracking_by_axle_m.values(), default=0.0)
-                rate_note = (
-                    " · steering rate limit exceeded"
-                    if result.max_steering_rate_deg_s > result.allowed_steering_rate_deg_s
+                simulation_note = (
+                    " · steering actuator saturated"
+                    if result.steering_rate_saturated
                     else ""
                 )
+                if not result.path_complete:
+                    simulation_note += " · target path not completed"
                 self.status.showMessage(
                     f"Kinematic swept path · {geometry.name} · "
                     f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
                     f"axle off-tracking {max_offtracking:.2f} m · "
                     f"articulation {result.maximum_articulation_deg:.1f}° · "
-                    f"steering rate {result.max_steering_rate_deg_s:.1f}°/s{rate_note}"
+                    f"steering rate {result.max_steering_rate_deg_s:.1f}°/s · "
+                    f"target path error {result.maximum_path_error_m:.2f} m{simulation_note}"
                 )
                 return
 
@@ -760,7 +764,13 @@ class MainWindow(QMainWindow):
     def _render_simulation_traces(self, result: SimulationResult, scale: float) -> None:
         colors = ("#1a1a1a", "#627f77", "#8b7560", "#6c7f94")
 
-        def add_trace(points: Sequence[tuple[float, float]], color: str, width: float) -> None:
+        def add_trace(
+            points: Sequence[tuple[float, float]],
+            color: str,
+            width: float,
+            *,
+            dashed: bool = False,
+        ) -> None:
             if len(points) < 2:
                 return
             path = QPainterPath()
@@ -770,14 +780,17 @@ class MainWindow(QMainWindow):
             pen = QPen(QColor(color))
             pen.setCosmetic(True)
             pen.setWidthF(width)
+            if dashed:
+                pen.setStyle(Qt.PenStyle.DashLine)
             item = QGraphicsPathItem(path)
             item.setPen(pen)
             item.setZValue(40)
             self.view.scene.addItem(item)
             self.trace_items.append(item)
 
-        # The solid coral line is the smoothed steer-axle trajectory used by the model.
-        add_trace(result.steer_axle_path, "#f28583", 2.6)
+        # Show the target path in coral and the rate-limited actual path in charcoal.
+        add_trace(result.target_steer_axle_path, "#f28583", 2.0, dashed=True)
+        add_trace(result.steer_axle_path, "#1a1a1a", 2.4)
         for unit_index, unit in enumerate(result.units):
             color = colors[unit_index % len(colors)]
             for axle_path in unit.axle_traces.values():
@@ -840,7 +853,7 @@ class MainWindow(QMainWindow):
         steer_path = (
             [
                 (x * self.simulation_scale, y * self.simulation_scale)
-                for x, y in self.simulation_result.steer_axle_path
+                for x, y in self.simulation_result.target_steer_axle_path
             ]
             if self.simulation_result is not None
             else self.route_points
@@ -851,6 +864,16 @@ class MainWindow(QMainWindow):
         )
 
         if self.simulation_result is not None:
+            actual_steer_layer = "OASP_ACTUAL_STEER_PATH"
+            if actual_steer_layer not in output.layers:
+                output.layers.new(actual_steer_layer, dxfattribs={"color": 7})
+            modelspace.add_lwpolyline(
+                [
+                    (x * self.simulation_scale, y * self.simulation_scale)
+                    for x, y in self.simulation_result.steer_axle_path
+                ],
+                dxfattribs={"layer": actual_steer_layer},
+            )
             axle_colors = (4, 5, 6, 3)
             for unit_index, unit in enumerate(self.simulation_result.units, start=1):
                 axle_layer = f"OASP_AXLE_U{unit_index}"
