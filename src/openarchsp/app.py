@@ -6,25 +6,29 @@ import json
 import sys
 import tempfile
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
 import ezdxf
+from shapely.affinity import scale as scale_geometry
 from PySide6.QtCore import QSettings, QSize, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
+    QIcon,
     QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
-    QIcon,
 )
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDockWidget,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -37,8 +41,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QStatusBar,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -49,6 +55,7 @@ from openarchsp.vehicles import (
     STANDARD_VEHICLES,
     VehicleDefinition,
 )
+from openarchsp.vehicle_kinematics import CombinationGeometry, SimulationResult, simulate_combination
 
 
 def asset_path(name: str) -> Path:
@@ -109,6 +116,79 @@ class DrawingView(QGraphicsView):
         super().keyPressEvent(event)
 
 
+class GeometryDialog(QDialog):
+    """Edit an explicit axle/coupling profile without baking guesses into presets."""
+
+    EXAMPLE = {
+        "name": "Example combination (edit to match the actual vehicle)",
+        "steer_axle_m": 3.8,
+        "max_steer_deg": 35.0,
+        "max_articulation_deg": 70.0,
+        "source_reference": "Illustrative example only; replace with verified vehicle data",
+        "units": [
+            {
+                "name": "Prime mover",
+                "width_m": 2.5,
+                "front_extent_m": 5.5,
+                "rear_extent_m": 0.9,
+                "axle_offsets_m": [3.8, 0.0, -1.3],
+                "track_m": 2.0,
+                "rear_hitch_m": 0.5,
+            },
+            {
+                "name": "Semi-trailer",
+                "width_m": 2.5,
+                "front_extent_m": 9.6,
+                "rear_extent_m": 3.3,
+                "axle_offsets_m": [0.0, -1.3, -2.6],
+                "track_m": 2.0,
+                "front_hitch_m": 9.6,
+            },
+        ],
+    }
+
+    def __init__(
+        self,
+        vehicle_name: str,
+        existing: CombinationGeometry | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Vehicle geometry — {vehicle_name}")
+        self.resize(700, 620)
+        self.geometry: CombinationGeometry | None = None
+        layout = QVBoxLayout(self)
+        help_label = QLabel(
+            "Enter one lead unit and any number of trailers. Distances are metres, "
+            "measured from each unit's rearmost axle group; positive axle offsets are "
+            "forward. Hitch offsets are measured to the axle group. The example values "
+            "are illustrative only: replace them with verified vehicle dimensions. "
+            "A trailing unit needs front_hitch_m; a towing unit needs rear_hitch_m."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+        self.editor = QPlainTextEdit()
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        data = existing.to_dict() if existing else self.EXAMPLE
+        self.editor.setPlainText(json.dumps(data, indent=2))
+        layout.addWidget(self.editor)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_geometry)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept_geometry(self) -> None:
+        try:
+            data = json.loads(self.editor.toPlainText())
+            self.geometry = CombinationGeometry.from_dict(data)
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            QMessageBox.warning(self, "Invalid vehicle geometry", str(error))
+            return
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -135,8 +215,12 @@ class MainWindow(QMainWindow):
         self._converted_base_path: Path | None = None
         self.route_points: list[tuple[float, float]] = []
         self.route_items: list[object] = []
+        self.trace_items: list[object] = []
         self.envelope_items: list[object] = []
         self.envelope_geometry = None
+        self.simulation_result: SimulationResult | None = None
+        self.simulation_scale = 1.0
+        self.vehicle_geometries = self._load_vehicle_geometries()
 
         self.vehicle_definitions = self._load_vehicle_definitions()
         self.view = DrawingView()
@@ -150,6 +234,9 @@ class MainWindow(QMainWindow):
         self.length_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.width_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.units_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.corner_radius_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.speed_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.lock_to_lock_spin.valueChanged.connect(self._vehicle_dimensions_changed)
 
         self.status = QStatusBar()
         self.status.showMessage("Open a DXF or DWG site drawing to begin")
@@ -169,6 +256,17 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError, KeyError):
             pass
         return definitions
+
+    def _load_vehicle_geometries(self) -> dict[str, CombinationGeometry]:
+        settings = QSettings("OpenArch", "OpenArchSweptPaths")
+        profiles: dict[str, CombinationGeometry] = {}
+        try:
+            saved = json.loads(settings.value("vehicleGeometries", "{}"))
+            for vehicle_id, entry in saved.items():
+                profiles[str(vehicle_id)] = CombinationGeometry.from_dict(entry)
+        except (TypeError, ValueError, KeyError, AttributeError):
+            pass
+        return profiles
 
     def _build_vehicle_panel(self) -> None:
         dock = QDockWidget("Vehicle and units", self)
@@ -194,6 +292,18 @@ class MainWindow(QMainWindow):
         form.addRow("Length (m)", self.length_spin)
         form.addRow("Width (m)", self.width_spin)
         form.addRow("Drawing units per metre", self.units_spin)
+        self.corner_radius_spin = self._dimension_spin(100.0, 12.5)
+        self.corner_radius_spin.setToolTip(
+            "Radius used to round path waypoints into tangential turns."
+        )
+        form.addRow("Waypoint turn radius (m)", self.corner_radius_spin)
+        self.speed_spin = self._dimension_spin(100.0, 5.0)
+        form.addRow("Travel speed (km/h)", self.speed_spin)
+        self.lock_to_lock_spin = self._dimension_spin(30.0, 6.0)
+        self.lock_to_lock_spin.setToolTip(
+            "Time for the road wheels to move from full lock one way to full lock the other."
+        )
+        form.addRow("Steering lock-to-lock (s)", self.lock_to_lock_spin)
 
         self.vehicle_source_label = QLabel()
         self.vehicle_source_label.setWordWrap(True)
@@ -208,7 +318,11 @@ class MainWindow(QMainWindow):
         self.save_vehicle_button.clicked.connect(self.save_custom_vehicle)
         form.addRow(self.save_vehicle_button)
 
-        self.calculate_action = QAction("Calculate rigid preview", self)
+        self.edit_geometry_button = QPushButton("Edit axle and coupling geometry…")
+        self.edit_geometry_button.clicked.connect(self.edit_vehicle_geometry)
+        form.addRow(self.edit_geometry_button)
+
+        self.calculate_action = QAction("Simulate swept path", self)
         self.calculate_action.triggered.connect(self.calculate_envelope)
         self.calculate_action.setEnabled(False)
 
@@ -326,8 +440,10 @@ class MainWindow(QMainWindow):
         self.drawing_path = path
         # draw_document() clears the scene, which also destroys existing overlay items.
         self.route_items.clear()
+        self.trace_items.clear()
         self.envelope_items.clear()
         self.envelope_geometry = None
+        self.simulation_result = None
         self.route_points.clear()
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
@@ -367,8 +483,20 @@ class MainWindow(QMainWindow):
 
     def _vehicle_selected(self, _index: int = 0) -> None:
         vehicle = self._selected_vehicle()
-        self.length_spin.setValue(vehicle.length_m)
-        self.width_spin.setValue(vehicle.width_m)
+        has_geometry = vehicle.id in self.vehicle_geometries
+        if hasattr(self, "draw_action"):
+            self.draw_action.setText(
+                "Draw steer-axle path" if has_geometry else "Draw reference path"
+            )
+        self.length_spin.setEnabled(not has_geometry)
+        self.width_spin.setEnabled(not has_geometry)
+        if has_geometry:
+            profile = self.vehicle_geometries[vehicle.id]
+            self.length_spin.setValue(profile.overall_length_m)
+            self.width_spin.setValue(profile.overall_width_m)
+        else:
+            self.length_spin.setValue(vehicle.length_m)
+            self.width_spin.setValue(vehicle.width_m)
         if vehicle.source_url:
             source = f'<a href="{vehicle.source_url}">{vehicle.source}</a>'
             self.vehicle_source_label.setText(source)
@@ -376,18 +504,25 @@ class MainWindow(QMainWindow):
         else:
             self.vehicle_source_label.setText(vehicle.source)
 
-        self.save_vehicle_button.setEnabled(vehicle.supports_preview)
-        if vehicle.supports_preview:
+        self.save_vehicle_button.setEnabled(vehicle.supports_preview and not has_geometry)
+        self.edit_geometry_button.setEnabled(True)
+        if has_geometry:
             self.vehicle_note_label.setText(
-                "Preview model: one rigid rectangle follows the drawn body-centre path. "
-                "It does not calculate steering geometry or axle off-tracking. "
-                "Confirm nominal widths against your project vehicle source."
+                "Simulation uses this explicit axle and coupling geometry. "
+                "Check the profile against the actual design-vehicle drawing. "
+                f"Source: {self.vehicle_geometries[vehicle.id].source_reference}. "
+                "The reported steering rate is the rate needed to follow the input path."
+            )
+        elif vehicle.supports_preview:
+            self.vehicle_note_label.setText(
+                "Legacy preview: a rigid rectangle follows the drawn body-centre path. "
+                "Edit axle geometry to simulate steer angle, wheel paths and off-tracking. "
+                "Confirm all dimensions against the project vehicle source."
             )
         else:
             self.vehicle_note_label.setText(
-                "This combination is in the catalogue, but its tractor, trailer, "
-                "axle and coupling geometry is not configured yet. Calculation is disabled. "
-                + vehicle.notes
+                "This combination needs verified tractor, trailer, axle and coupling geometry. "
+                "Edit the geometry profile to enable articulated simulation. " + vehicle.notes
             )
         self._clear_envelope()
         self._update_export_state()
@@ -395,6 +530,27 @@ class MainWindow(QMainWindow):
     def _vehicle_dimensions_changed(self, _value: float = 0.0) -> None:
         self._clear_envelope()
         self._update_export_state()
+
+    def edit_vehicle_geometry(self) -> None:
+        vehicle = self._selected_vehicle()
+        dialog = GeometryDialog(
+            vehicle.name,
+            self.vehicle_geometries.get(vehicle.id),
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.geometry is None:
+            return
+        self.vehicle_geometries[vehicle.id] = dialog.geometry
+        settings = QSettings("OpenArch", "OpenArchSweptPaths")
+        settings.setValue(
+            "vehicleGeometries",
+            json.dumps(
+                {key: value.to_dict() for key, value in self.vehicle_geometries.items()}
+            ),
+        )
+        self._clear_envelope()
+        self._vehicle_selected()
+        self.status.showMessage(f"Saved kinematic geometry for {vehicle.name}")
 
     def save_custom_vehicle(self) -> None:
         name, accepted = QInputDialog.getText(
@@ -431,8 +587,13 @@ class MainWindow(QMainWindow):
         if enabled:
             self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.view.setFocus()
+            path_name = (
+                "steer-axle path"
+                if self._selected_vehicle().id in self.vehicle_geometries
+                else "body-centre path"
+            )
             self.status.showMessage(
-                "Click body-centre path points · Right-click or Enter to finish · Esc to stop drawing"
+                f"Click {path_name} points · Right-click or Enter to finish · Esc to stop drawing"
             )
         else:
             self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -474,10 +635,14 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Reference path cleared")
 
     def _clear_envelope(self) -> None:
+        for item in self.trace_items:
+            self.view.scene.removeItem(item)
+        self.trace_items.clear()
         for item in self.envelope_items:
             self.view.scene.removeItem(item)
         self.envelope_items.clear()
         self.envelope_geometry = None
+        self.simulation_result = None
 
     def _render_route(self) -> None:
         for item in self.route_items:
@@ -516,17 +681,57 @@ class MainWindow(QMainWindow):
         if len(self.route_points) < 2:
             return
         vehicle = self._selected_vehicle()
-        if not vehicle.supports_preview:
+        geometry = self.vehicle_geometries.get(vehicle.id)
+        if geometry is None and not vehicle.supports_preview:
             QMessageBox.information(
                 self,
-                "Articulated geometry needed",
-                "This vehicle needs a complete tractor, axle, trailer and coupling profile "
-                "before a swept envelope can be calculated.",
+                "Vehicle geometry needed",
+                "Configure the unit, axle and coupling geometry for this combination first.",
             )
             return
 
         scale = self.units_spin.value()
+        self._clear_envelope()
         try:
+            if geometry is not None:
+                route_metres = [
+                    (x / scale, y / scale) for x, y in self.route_points
+                ]
+                result = simulate_combination(
+                    route_metres,
+                    geometry,
+                    corner_radius_m=self.corner_radius_spin.value(),
+                    spacing_m=0.25,
+                    speed_kmh=self.speed_spin.value(),
+                    lock_to_lock_s=self.lock_to_lock_spin.value(),
+                )
+                self.simulation_result = result
+                self.simulation_scale = scale
+                self.envelope_geometry = scale_geometry(
+                    result.envelope, xfact=scale, yfact=scale, origin=(0, 0)
+                )
+                self._render_simulation_traces(result, scale)
+                self._render_envelope(self.envelope_geometry)
+                max_steer = max(abs(value) for value in result.steering_angles_deg)
+                max_wheel_steer = max(
+                    (abs(angle) for pair in result.front_wheel_angles_deg for angle in pair),
+                    default=0.0,
+                )
+                max_offtracking = max(result.offtracking_by_axle_m.values(), default=0.0)
+                rate_note = (
+                    " · steering rate limit exceeded"
+                    if result.max_steering_rate_deg_s > result.allowed_steering_rate_deg_s
+                    else ""
+                )
+                self.status.showMessage(
+                    f"Kinematic swept path · {geometry.name} · "
+                    f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
+                    f"axle off-tracking {max_offtracking:.2f} m · "
+                    f"articulation {result.maximum_articulation_deg:.1f}° · "
+                    f"steering rate {result.max_steering_rate_deg_s:.1f}°/s{rate_note}"
+                )
+                return
+
             result = swept_footprint(
                 self.route_points,
                 self.length_spin.value() * scale,
@@ -538,9 +743,44 @@ class MainWindow(QMainWindow):
             return
 
         self.envelope_geometry = result
+        self._render_envelope(result)
+        self.status.showMessage(
+            f"Rigid-body footprint preview · {vehicle.name} · "
+            f"{self.length_spin.value():.2f} m × {self.width_spin.value():.2f} m"
+        )
+
+    def _render_simulation_traces(self, result: SimulationResult, scale: float) -> None:
+        colors = ("#1a1a1a", "#627f77", "#8b7560", "#6c7f94")
+
+        def add_trace(points: Sequence[tuple[float, float]], color: str, width: float) -> None:
+            if len(points) < 2:
+                return
+            path = QPainterPath()
+            path.moveTo(points[0][0] * scale, -points[0][1] * scale)
+            for x, y in points[1:]:
+                path.lineTo(x * scale, -y * scale)
+            pen = QPen(QColor(color))
+            pen.setCosmetic(True)
+            pen.setWidthF(width)
+            item = QGraphicsPathItem(path)
+            item.setPen(pen)
+            item.setZValue(40)
+            self.view.scene.addItem(item)
+            self.trace_items.append(item)
+
+        # The solid coral line is the smoothed steer-axle trajectory used by the model.
+        add_trace(result.steer_axle_path, "#f28583", 2.6)
+        for unit_index, unit in enumerate(result.units):
+            color = colors[unit_index % len(colors)]
+            for axle_path in unit.axle_traces.values():
+                add_trace(axle_path, color, 1.3)
+            for wheel_path in unit.wheel_traces.values():
+                add_trace(wheel_path, "#84a69d", 0.8)
+
+    def _render_envelope(self, geometry: object) -> None:
         path = QPainterPath()
         path.setFillRule(Qt.FillRule.OddEvenFill)
-        for polygon in polygons(result):
+        for polygon in polygons(geometry):
             self._add_ring(path, polygon.exterior.coords)
             for interior in polygon.interiors:
                 self._add_ring(path, interior.coords)
@@ -551,10 +791,6 @@ class MainWindow(QMainWindow):
         envelope.setZValue(50)
         self.view.scene.addItem(envelope)
         self.envelope_items.append(envelope)
-        self.status.showMessage(
-            f"Rigid-body footprint preview · {vehicle.name} · "
-            f"{self.length_spin.value():.2f} m × {self.width_spin.value():.2f} m"
-        )
 
     @staticmethod
     def _add_ring(path: QPainterPath, coordinates: object) -> None:
@@ -571,7 +807,10 @@ class MainWindow(QMainWindow):
         has_path = self.document is not None and len(self.route_points) >= 2
         self.export_action.setEnabled(has_path)
         self.save_copy_action.setEnabled(has_path)
-        can_calculate = has_path and self._selected_vehicle().supports_preview
+        vehicle = self._selected_vehicle()
+        can_calculate = has_path and (
+            vehicle.supports_preview or vehicle.id in self.vehicle_geometries
+        )
         self.calculate_action.setEnabled(can_calculate)
 
     def _save_route(self, target: str, include_base: bool) -> None:
@@ -590,10 +829,41 @@ class MainWindow(QMainWindow):
                 "OASP_STEERING_PATH",
                 dxfattribs={"color": 1, "lineweight": 35},
             )
+        steer_path = (
+            [
+                (x * self.simulation_scale, y * self.simulation_scale)
+                for x, y in self.simulation_result.steer_axle_path
+            ]
+            if self.simulation_result is not None
+            else self.route_points
+        )
         modelspace.add_lwpolyline(
-            self.route_points,
+            steer_path,
             dxfattribs={"layer": "OASP_STEERING_PATH"},
         )
+
+        if self.simulation_result is not None:
+            if "OASP_AXLE_PATHS" not in output.layers:
+                output.layers.new("OASP_AXLE_PATHS", dxfattribs={"color": 4})
+            if "OASP_WHEEL_PATHS" not in output.layers:
+                output.layers.new("OASP_WHEEL_PATHS", dxfattribs={"color": 94})
+            for unit in self.simulation_result.units:
+                for points in unit.axle_traces.values():
+                    modelspace.add_lwpolyline(
+                        [
+                            (x * self.simulation_scale, y * self.simulation_scale)
+                            for x, y in points
+                        ],
+                        dxfattribs={"layer": "OASP_AXLE_PATHS"},
+                    )
+                for points in unit.wheel_traces.values():
+                    modelspace.add_lwpolyline(
+                        [
+                            (x * self.simulation_scale, y * self.simulation_scale)
+                            for x, y in points
+                        ],
+                        dxfattribs={"layer": "OASP_WHEEL_PATHS"},
+                    )
 
         if self.envelope_geometry is not None:
             if "OASP_SWEPT_ENVELOPE_PREVIEW" not in output.layers:
