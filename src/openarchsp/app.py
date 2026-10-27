@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 
 from openarchsp.drawing import convert_dwg_to_dxf, draw_document, read_dxf
 from openarchsp.swept_path import polygons, swept_footprint
+from openarchsp.standard_profiles import standard_vehicle_geometries
 from openarchsp.vehicles import (
     CUSTOM_RIGID_VEHICLE,
     STANDARD_VEHICLES,
@@ -163,7 +164,8 @@ class GeometryDialog(QDialog):
             "measured from each unit's rearmost axle group; positive axle offsets are "
             "forward. Hitch offsets are measured to the axle group. The example values "
             "are illustrative only: replace them with verified vehicle dimensions. "
-            "A trailing unit needs front_hitch_m; a towing unit needs rear_hitch_m."
+            "A trailing unit needs front_hitch_m; a towing unit needs rear_hitch_m. "
+            "A rear_hitch_m value is positive behind the axle group and negative ahead."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
@@ -260,7 +262,7 @@ class MainWindow(QMainWindow):
 
     def _load_vehicle_geometries(self) -> dict[str, CombinationGeometry]:
         settings = QSettings("OpenArch", "OpenArchSweptPaths")
-        profiles: dict[str, CombinationGeometry] = {}
+        profiles = standard_vehicle_geometries()
         try:
             saved = json.loads(settings.value("vehicleGeometries", "{}"))
             for vehicle_id, entry in saved.items():
@@ -512,12 +514,13 @@ class MainWindow(QMainWindow):
         else:
             self.vehicle_source_label.setText(vehicle.source)
 
-        self.save_vehicle_button.setEnabled(vehicle.supports_preview and not has_geometry)
+        self.save_vehicle_button.setEnabled(vehicle.supports_preview)
         self.edit_geometry_button.setEnabled(True)
         if has_geometry:
             self.vehicle_note_label.setText(
                 "Simulation uses this explicit axle and coupling geometry. "
-                "Check the profile against the actual design-vehicle drawing. "
+                "Review the source notes and verify all dimensions, steering limits "
+                "and coupling stations for the project vehicle. "
                 f"Source: {self.vehicle_geometries[vehicle.id].source_reference}. "
                 "The solver rate-limits steering; compare the target and actual paths "
                 "and watch for saturation."

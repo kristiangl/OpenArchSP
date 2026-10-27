@@ -9,3 +9,4 @@ dist/
 release-output/
 packaging/windows/output/
 dwg-helper/target/
+work/apg34_*

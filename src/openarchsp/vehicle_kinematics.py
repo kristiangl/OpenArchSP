@@ -22,7 +22,7 @@ Point = tuple[float, float]
 
 @dataclass(frozen=True)
 class VehicleUnitGeometry:
-    """One rigid vehicle body with axle and coupling offsets from its rear axle group."""
+    """One vehicle body with axle and coupling offsets from its rear axle group."""
 
     name: str
     width_m: float
@@ -32,12 +32,21 @@ class VehicleUnitGeometry:
     track_m: float
     front_hitch_m: float = 0.0
     rear_hitch_m: float = 0.0
+    hitch_width_m: float = 0.25
 
-    def validate(self, *, is_lead: bool, has_successor: bool) -> None:
+    def validate(self, *, has_predecessor: bool) -> None:
         if not self.name.strip():
             raise ValueError("Every vehicle unit needs a name.")
-        if min(self.width_m, self.front_extent_m, self.rear_extent_m, self.track_m) <= 0:
-            raise ValueError(f"{self.name}: width, body extents and axle track must be positive.")
+        if min(
+            self.width_m,
+            self.front_extent_m,
+            self.rear_extent_m,
+            self.track_m,
+            self.hitch_width_m,
+        ) <= 0:
+            raise ValueError(
+                f"{self.name}: width, body extents, axle track and hitch width must be positive."
+            )
         if not self.axle_offsets_m:
             raise ValueError(f"{self.name}: enter at least one axle position.")
         if any(
@@ -45,12 +54,8 @@ class VehicleUnitGeometry:
             for offset in self.axle_offsets_m
         ):
             raise ValueError(f"{self.name}: an axle lies outside the body extents.")
-        if is_lead and self.rear_hitch_m <= 0 and has_successor:
-            raise ValueError(f"{self.name}: enter the rear coupling distance behind its axle group.")
-        if not is_lead and self.front_hitch_m <= 0:
+        if has_predecessor and self.front_hitch_m <= 0:
             raise ValueError(f"{self.name}: enter the distance from its front coupling to its axle group.")
-        if min(self.front_hitch_m, self.rear_hitch_m) < 0:
-            raise ValueError("Coupling distances cannot be negative.")
 
 
 @dataclass(frozen=True)
@@ -73,14 +78,18 @@ class CombinationGeometry:
                 - self.units[index - 1].rear_hitch_m
                 - self.units[index].front_hitch_m
             )
-        front = max(
-            reference + unit.front_extent_m
+        front_points = [
+            reference + offset
             for reference, unit in zip(references, self.units)
-        )
-        rear = min(
-            reference - unit.rear_extent_m
+            for offset in (unit.front_extent_m, unit.front_hitch_m, -unit.rear_hitch_m)
+        ]
+        rear_points = [
+            reference + offset
             for reference, unit in zip(references, self.units)
-        )
+            for offset in (-unit.rear_extent_m, unit.front_hitch_m, -unit.rear_hitch_m)
+        ]
+        front = max(front_points)
+        rear = min(rear_points)
         return front - rear
 
     @property
@@ -105,6 +114,7 @@ class CombinationGeometry:
                 track_m=float(raw["track_m"]),
                 front_hitch_m=float(raw.get("front_hitch_m", 0.0)),
                 rear_hitch_m=float(raw.get("rear_hitch_m", 0.0)),
+                hitch_width_m=float(raw.get("hitch_width_m", 0.25)),
             )
             for raw in raw_units
         )
@@ -129,7 +139,7 @@ class CombinationGeometry:
         if not 0 < self.max_articulation_deg < 180:
             raise ValueError("Maximum articulation angle must be between 0 and 180 degrees.")
         for index, unit in enumerate(self.units):
-            unit.validate(is_lead=index == 0, has_successor=index < len(self.units) - 1)
+            unit.validate(has_predecessor=index > 0)
 
 
 @dataclass(frozen=True)
@@ -389,6 +399,24 @@ def _rectangle(reference: Point, heading: float, unit: VehicleUnitGeometry) -> P
     return Polygon(corners)
 
 
+def _coupling_strip(
+    reference: Point, heading: float, start_m: float, end_m: float, width_m: float
+) -> Polygon:
+    forward = _unit(heading)
+    side = _normal(heading)
+    start = _add(reference, _scale(forward, start_m))
+    end = _add(reference, _scale(forward, end_m))
+    half_width = width_m / 2
+    return Polygon(
+        (
+            _add(start, _scale(side, half_width)),
+            _sub(start, _scale(side, half_width)),
+            _sub(end, _scale(side, half_width)),
+            _add(end, _scale(side, half_width)),
+        )
+    )
+
+
 def simulate_combination(
     route: Sequence[Point],
     geometry: CombinationGeometry,
@@ -593,6 +621,38 @@ def simulate_combination(
             wheel_traces[f"{key} right wheel"] = tuple(right_wheels)
         for reference, heading in poses:
             polygons.append(_rectangle(reference, heading, unit))
+            front_hitch = unit.front_hitch_m
+            if front_hitch > unit.front_extent_m:
+                polygons.append(
+                    _coupling_strip(
+                        reference,
+                        heading,
+                        unit.front_extent_m,
+                        front_hitch,
+                        unit.hitch_width_m,
+                    )
+                )
+            rear_hitch = -unit.rear_hitch_m
+            if rear_hitch < -unit.rear_extent_m:
+                polygons.append(
+                    _coupling_strip(
+                        reference,
+                        heading,
+                        rear_hitch,
+                        -unit.rear_extent_m,
+                        unit.hitch_width_m,
+                    )
+                )
+            elif rear_hitch > unit.front_extent_m:
+                polygons.append(
+                    _coupling_strip(
+                        reference,
+                        heading,
+                        unit.front_extent_m,
+                        rear_hitch,
+                        unit.hitch_width_m,
+                    )
+                )
         trajectories.append(
             UnitTrajectory(
                 unit.name,
