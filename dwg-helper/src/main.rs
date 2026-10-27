@@ -9,7 +9,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: openarch-dwg-helper <input.dwg> <output.dxf>".into());
     }
 
-    let reader = DwgReader::from_file(&arguments[1])?;
+    let mut reader = DwgReader::from_file(&arguments[1])?;
     let document = reader.read()?;
     DxfWriter::new(&document).write_to_file(&arguments[2])?;
     Ok(())
