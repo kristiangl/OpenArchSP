@@ -89,6 +89,7 @@ jobs:
           --name OpenArchSweptPaths
           --paths src
           --collect-all ezdxf
+          --collect-all shapely
           src/openarchsp/app.py
 
       - name: Install Inno Setup
@@ -173,6 +174,7 @@ jobs:
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 
 
 

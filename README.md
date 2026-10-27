@@ -1,25 +1,32 @@
 # OpenArch Swept Paths
 
-OpenArch Swept Paths is a standalone desktop application built with Python, PySide6 (Qt) and ezdxf. The application is packaged separately on native Windows, macOS and Linux runners; PyInstaller does not cross-compile desktop binaries between operating systems.
+OpenArch Swept Paths is a standalone desktop application built with Python, PySide6 (Qt), ezdxf and Shapely. The app reads and writes DXF drawings. GitHub Actions packages it on native Windows, macOS and Linux runners.
 
 ## Downloads
 
-- **Windows x64:** Install with the .exe setup program.
-- **macOS Intel and Apple Silicon:** Open the matching .dmg and drag the app into Applications. These builds are currently unsigned and not notarized, so macOS may require you to approve the app the first time it opens.
-- **Linux x86_64:** Make the .AppImage executable, then launch it. It is built on Ubuntu 22.04 and requires a compatible glibc-based Linux distribution.
+Open the repository’s Actions page and choose the latest successful Build installers run. Download the artifact for your platform and unzip it:
 
-On every push to main, pull request, or manual workflow run, GitHub Actions builds all four platform packages. The files are downloadable from that run's Artifacts section for 14 days. To publish permanent downloads under Releases, update the version in pyproject.toml, push a matching version tag such as v0.1.1, and wait for the workflow to finish.
+- **Windows x64:** Run the OpenArch Swept Paths Setup executable.
+- **macOS Intel or Apple Silicon:** Open the matching disk image and drag the app into Applications. Builds are unsigned and not notarized, so macOS may require approval on first launch.
+- **Linux x86_64:** Make the AppImage executable and launch it. It is built on Ubuntu 22.04 and targets compatible glibc-based distributions.
 
-The GitHub-hosted build matrix creates Windows x64, macOS Intel, macOS Apple Silicon and Linux x86_64 packages. The macOS builds are separate because PyInstaller packages for the architecture on which it runs.
+Actions artifacts are retained for 14 days. A matching version tag publishes permanent downloads under Releases. Bump the version in pyproject.toml and push a matching tag, for example v0.1.1.
 
 ## Current workflow
 
 1. Open a DXF site drawing as a base layer.
 2. Pan with the mouse and zoom with the wheel; use View → Zoom to Extents to reframe.
-3. Select Draw steering path, then click path points in order. Right-click or press Enter to finish. Backspace removes the last point.
-4. Export the steering path as a separate DXF, or save a new DXF containing a copy of the base drawing and the path.
+3. Choose a design vehicle and check or edit its overall length and width.
+4. Draw a body-centre reference path by clicking points; right-click or press Enter to finish. Backspace undoes the last point.
+5. For rigid vehicles, calculate a sampled rectangular footprint preview. Export the path and preview as a separate DXF or save them into a copy of the original drawing.
 
-The original source drawing is never overwritten. The generated path is placed on the OASP_STEERING_PATH layer.
+The source drawing is never overwritten. The reference path is saved on OASP_STEERING_PATH and the preview boundary on OASP_SWEPT_ENVELOPE_PREVIEW. DXF units are read when available; unitless files default to metres and expose a drawing-units-per-metre control.
+
+The initial Austroads catalogue includes passenger vehicle, service vehicle, truck/bus, semi-trailer, B-double, B-triple, A-double and A-triple definitions. Overall lengths are attributed to AP-G34-23. User-defined rigid vehicle profiles are saved locally between runs.
+
+## Model limits
+
+The current calculator is a rigid rectangle following the drawn body-centre path. It is a visual preview, not a full vehicle dynamics or design-vehicle simulation: it does not calculate steering limits, wheel paths, axle off-tracking or articulated trailer motion. Articulated vehicles are listed but calculation is disabled until their tractor, axle, trailer and coupling geometry is configured and validated.
 
 The drawing viewer currently renders model-space LINE, LWPOLYLINE, POLYLINE, CIRCLE and ARC entities. Paper space, blocks, text and other entity types are not yet displayed.
 
@@ -38,11 +45,9 @@ PowerShell:
 
 On macOS or Linux, activate the environment with source .venv/bin/activate.
 
-## Swept-path roadmap
+## Roadmap
 
-- Australian design-vehicle library with editable and source-attributed dimensions.
-- Turning and articulated-vehicle kinematics, followed by swept-envelope rendering.
-- DXF export of vehicle paths and envelopes.
+- Accurate articulated kinematics and geometry for semi-trailers, B-doubles, B-triples and road trains.
+- Turning input and realistic steering constraints.
+- Validation against authoritative Austroads and jurisdictional turning templates.
 - Optional DWG conversion support.
-
-Austroads AP-G34-23 is the initial reference for design-vehicle definitions. Jurisdictional variants and project-specific vehicles need to remain configurable. Before design use, vehicle geometry, steering assumptions, clearances and generated paths must be validated against authoritative templates and representative cases.
