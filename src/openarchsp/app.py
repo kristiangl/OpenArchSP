@@ -7,11 +7,12 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import ezdxf
 from shapely.affinity import scale as scale_geometry
-from PySide6.QtCore import QSettings, QSize, Qt, Signal
+from PySide6.QtCore import QSettings, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -461,7 +462,12 @@ class MainWindow(QMainWindow):
         self.units_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.corner_radius_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.speed_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.steering_limit_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.lock_to_lock_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(180)
+        self.preview_timer.timeout.connect(self._preview_current_route)
 
         self.status = QStatusBar()
         self.status.showMessage("Open a DXF or DWG site drawing to begin")
@@ -524,6 +530,12 @@ class MainWindow(QMainWindow):
         form.addRow("Waypoint turn radius (m)", self.corner_radius_spin)
         self.speed_spin = self._dimension_spin(100.0, 5.0)
         form.addRow("Travel speed (km/h)", self.speed_spin)
+        self.steering_limit_spin = self._dimension_spin(60.0, 35.0)
+        self.steering_limit_spin.setToolTip(
+            "Maximum centre road-wheel angle used by the live steering simulation. "
+            "This overrides the vehicle profile for the current run."
+        )
+        form.addRow("Maximum road-wheel angle (°)", self.steering_limit_spin)
         self.lock_to_lock_spin = self._dimension_spin(30.0, 6.0)
         self.lock_to_lock_spin.setToolTip(
             "Time for the road wheels to move from full lock one way to full lock the other."
@@ -547,8 +559,8 @@ class MainWindow(QMainWindow):
         self.edit_geometry_button.clicked.connect(self.edit_vehicle_geometry)
         form.addRow(self.edit_geometry_button)
 
-        self.calculate_action = QAction("Simulate swept path", self)
-        self.calculate_action.triggered.connect(self.calculate_envelope)
+        self.calculate_action = QAction("Preview swept path", self)
+        self.calculate_action.triggered.connect(lambda: self.calculate_envelope())
         self.calculate_action.setEnabled(False)
 
         dock.setWidget(panel)
@@ -726,9 +738,11 @@ class MainWindow(QMainWindow):
             profile = self.vehicle_geometries[vehicle.id]
             self.length_spin.setValue(profile.overall_length_m)
             self.width_spin.setValue(profile.overall_width_m)
+            self.steering_limit_spin.setValue(profile.max_steer_deg)
         else:
             self.length_spin.setValue(vehicle.length_m)
             self.width_spin.setValue(vehicle.width_m)
+        self.steering_limit_spin.setEnabled(has_geometry)
         if vehicle.source_url:
             source = f'<a href="{vehicle.source_url}">{vehicle.source}</a>'
             self.vehicle_source_label.setText(source)
@@ -760,10 +774,25 @@ class MainWindow(QMainWindow):
             )
         self._clear_envelope()
         self._update_export_state()
+        self._queue_live_preview()
 
     def _vehicle_dimensions_changed(self, _value: float = 0.0) -> None:
         self._clear_envelope()
         self._update_export_state()
+        self._queue_live_preview()
+
+    def _queue_live_preview(self) -> None:
+        if len(self.route_points) >= 2 and self.document is not None:
+            self.preview_timer.start()
+
+    def _preview_current_route(self) -> None:
+        if len(self.route_points) >= 2:
+            self.calculate_envelope(show_errors=False)
+
+    def _route_label(self) -> str:
+        if self._selected_vehicle().id in self.vehicle_geometries:
+            return "Steer-axle path"
+        return "Reference path"
 
     def edit_vehicle_geometry(self) -> None:
         vehicle = self._selected_vehicle()
@@ -827,7 +856,8 @@ class MainWindow(QMainWindow):
                 else "body-centre path"
             )
             self.status.showMessage(
-                f"Click {path_name} points · Right-click or Enter to finish · Esc to stop drawing"
+                f"Click {path_name} points · swept preview updates after each click · "
+                "Right-click or Enter to finish · Esc to stop drawing"
             )
         else:
             self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -838,17 +868,21 @@ class MainWindow(QMainWindow):
         self._clear_envelope()
         self._render_route()
         self._update_export_state()
-        self.status.showMessage(f"Reference path: {len(self.route_points)} points")
+        self.status.showMessage(f"{self._route_label()}: {len(self.route_points)} points")
+        self._queue_live_preview()
 
     def finish_route(self) -> None:
+        self.preview_timer.stop()
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
         if len(self.route_points) < 2:
             self.status.showMessage("Add at least two points to define a path")
         else:
-            self.status.showMessage(
-                f"Reference path complete · {len(self.route_points)} points"
-            )
+            self.calculate_envelope(show_errors=False)
+            if self.simulation_result is None and self.envelope_geometry is None:
+                self.status.showMessage(
+                    f"{self._route_label()} complete · {len(self.route_points)} points"
+                )
 
     def undo_route_point(self) -> None:
         if not self.route_points:
@@ -857,9 +891,11 @@ class MainWindow(QMainWindow):
         self._clear_envelope()
         self._render_route()
         self._update_export_state()
-        self.status.showMessage(f"Reference path: {len(self.route_points)} points")
+        self.status.showMessage(f"{self._route_label()}: {len(self.route_points)} points")
+        self._queue_live_preview()
 
     def clear_route(self) -> None:
+        self.preview_timer.stop()
         self.route_points.clear()
         self._clear_envelope()
         self.draw_action.setChecked(False)
@@ -911,29 +947,34 @@ class MainWindow(QMainWindow):
             self.view.scene.addItem(marker)
             self.route_items.append(marker)
 
-    def calculate_envelope(self) -> None:
+    def calculate_envelope(
+        self, _checked: bool = False, *, show_errors: bool = True
+    ) -> None:
         if len(self.route_points) < 2:
             return
         vehicle = self._selected_vehicle()
         geometry = self.vehicle_geometries.get(vehicle.id)
         if geometry is None and not vehicle.supports_preview:
-            QMessageBox.information(
-                self,
-                "Vehicle geometry needed",
-                "Configure the unit, axle and coupling geometry for this combination first.",
-            )
+            message = "Configure the unit, axle and coupling geometry for this combination first."
+            if show_errors:
+                QMessageBox.information(self, "Vehicle geometry needed", message)
+            else:
+                self.status.showMessage(f"Preview unavailable · {message}")
             return
 
         scale = self.units_spin.value()
         self._clear_envelope()
         try:
             if geometry is not None:
+                run_geometry = replace(
+                    geometry, max_steer_deg=self.steering_limit_spin.value()
+                )
                 route_metres = [
                     (x / scale, y / scale) for x, y in self.route_points
                 ]
                 result = simulate_combination(
                     route_metres,
-                    geometry,
+                    run_geometry,
                     corner_radius_m=self.corner_radius_spin.value(),
                     spacing_m=0.25,
                     speed_kmh=self.speed_spin.value(),
@@ -960,7 +1001,7 @@ class MainWindow(QMainWindow):
                 if not result.path_complete:
                     simulation_note += " · target path not completed"
                 self.status.showMessage(
-                    f"Kinematic swept path · {geometry.name} · "
+                    f"Swept path preview · {geometry.name} · "
                     f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
                     f"axle off-tracking {max_offtracking:.2f} m · "
                     f"articulation {result.maximum_articulation_deg:.1f}° · "
@@ -976,7 +1017,10 @@ class MainWindow(QMainWindow):
                 max(0.25 * scale, 1e-6),
             )
         except Exception as error:
-            QMessageBox.warning(self, "Could not calculate preview", str(error))
+            if show_errors:
+                QMessageBox.warning(self, "Could not calculate preview", str(error))
+            else:
+                self.status.showMessage(f"Live preview unavailable · {error}")
             return
 
         self.envelope_geometry = result
