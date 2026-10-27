@@ -18,6 +18,8 @@ ArchitecturesInstallIn64BitMode=x64
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\icons\openarchsp.ico
+UninstallDisplayIcon={app}\OpenArchSweptPaths.exe
 PrivilegesRequired=admin
 
 [Languages]

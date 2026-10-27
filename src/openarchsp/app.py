@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 import ezdxf
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QSettings, QSize, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -18,7 +18,9 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QIcon,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -47,6 +49,21 @@ from openarchsp.vehicles import (
     STANDARD_VEHICLES,
     VehicleDefinition,
 )
+
+
+def asset_path(name: str) -> Path:
+    """Resolve a packaged brand asset in development and frozen builds."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "openarchsp" / "assets" / name
+    return Path(__file__).resolve().parent / "assets" / name
+
+
+def action_icon(name: str) -> QIcon:
+    icon_file = asset_path(f"icons/{name}.svg")
+    # Importing QtSvg makes PyInstaller include the SVG image plugin used by QIcon.
+    if not QSvgRenderer(str(icon_file)).isValid():
+        return QIcon()
+    return QIcon(str(icon_file))
 
 
 class DrawingView(QGraphicsView):
@@ -97,6 +114,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("OpenArch Swept Paths")
         self.resize(1280, 820)
+        self.setWindowIcon(QIcon(str(asset_path("app-icon.svg"))))
+        self.setStyleSheet(
+            "QMainWindow { background: #f0efeb; }"
+            "QToolBar { background: #f0efeb; border: 0; border-bottom: 1px solid #d7d4ce; "
+            "spacing: 8px; padding: 6px; }"
+            "QToolButton { color: #1a1a1a; padding: 5px 8px; border-radius: 5px; }"
+            "QToolButton:hover { background: #e5e4df; }"
+            "QToolButton:checked { background: #84a69d; }"
+            "QDockWidget::title { background: #84a69d; color: #1a1a1a; "
+            "padding: 7px; font-weight: 600; }"
+            "QComboBox, QDoubleSpinBox, QPushButton { padding: 5px; }"
+            "QPushButton { background: #f28583; color: #1a1a1a; border: 0; "
+            "border-radius: 4px; font-weight: 600; }"
+            "QPushButton:hover { background: #ed7775; }"
+        )
         self.document = None
         self.drawing_path: Path | None = None
         self._dwg_tempdir: tempfile.TemporaryDirectory[str] | None = None
@@ -195,52 +227,67 @@ class MainWindow(QMainWindow):
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
         self.open_action = QAction("&Open drawing…", self)
+        self.open_action.setIcon(action_icon("open"))
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
         self.open_action.triggered.connect(self.open_dxf)
         file_menu.addAction(self.open_action)
 
         self.export_action = QAction("Export path and envelope as DXF…", self)
+        self.export_action.setIcon(action_icon("export"))
         self.export_action.triggered.connect(self.export_path)
         self.export_action.setEnabled(False)
         file_menu.addAction(self.export_action)
 
         self.save_copy_action = QAction("Save drawing copy with path and envelope as…", self)
+        self.save_copy_action.setIcon(action_icon("save-copy"))
         self.save_copy_action.triggered.connect(self.save_drawing_copy)
         self.save_copy_action.setEnabled(False)
         file_menu.addAction(self.save_copy_action)
 
         view_menu = self.menuBar().addMenu("&View")
         fit_action = QAction("Zoom to &Extents", self)
+        fit_action.setIcon(action_icon("zoom-extents"))
         fit_action.setShortcut("Z")
         fit_action.triggered.connect(self.view.fit_drawing)
         view_menu.addAction(fit_action)
 
         toolbar = QToolBar("Path")
         toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(22, 22))
         self.addToolBar(toolbar)
+        toolbar.addAction(self.open_action)
+        toolbar.addSeparator()
 
         self.draw_action = QAction("Draw reference path", self)
+        self.draw_action.setIcon(action_icon("draw-path"))
         self.draw_action.setCheckable(True)
         self.draw_action.setEnabled(False)
         self.draw_action.triggered.connect(self.set_drawing_mode)
         toolbar.addAction(self.draw_action)
 
         self.finish_action = QAction("Finish path", self)
+        self.finish_action.setIcon(action_icon("finish-path"))
         self.finish_action.setShortcut(QKeySequence("Return"))
         self.finish_action.setEnabled(False)
         self.finish_action.triggered.connect(self.finish_route)
         toolbar.addAction(self.finish_action)
 
         undo_action = QAction("Undo point", self)
+        undo_action.setIcon(action_icon("undo"))
         undo_action.setShortcut(QKeySequence("Backspace"))
         undo_action.triggered.connect(self.undo_route_point)
         toolbar.addAction(undo_action)
 
         clear_action = QAction("Clear path", self)
+        clear_action.setIcon(action_icon("clear-path"))
         clear_action.triggered.connect(self.clear_route)
         toolbar.addAction(clear_action)
 
         toolbar.addAction(self.calculate_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.export_action)
+        toolbar.addAction(self.save_copy_action)
+        self.calculate_action.setIcon(action_icon("calculate"))
 
     def open_dxf(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -444,7 +491,7 @@ class MainWindow(QMainWindow):
         path.moveTo(first_x, -first_y)
         for x, y in self.route_points[1:]:
             path.lineTo(x, -y)
-        pen = QPen(Qt.GlobalColor.darkRed)
+        pen = QPen(QColor("#f28583"))
         pen.setCosmetic(True)
         pen.setWidthF(2.5)
         line_item = QGraphicsPathItem(path)
@@ -458,7 +505,7 @@ class MainWindow(QMainWindow):
         marker_pen.setWidthF(1.5)
         for index, (x, y) in enumerate(self.route_points):
             marker = QGraphicsEllipseItem(x - 0.12, -y - 0.12, 0.24, 0.24)
-            marker.setBrush(Qt.GlobalColor.darkRed)
+            marker.setBrush(QColor("#f28583"))
             marker.setPen(marker_pen)
             marker.setZValue(101)
             marker.setToolTip(f"Point {index + 1}: {x:.3f}, {y:.3f}")
@@ -499,8 +546,8 @@ class MainWindow(QMainWindow):
                 self._add_ring(path, interior.coords)
 
         envelope = QGraphicsPathItem(path)
-        envelope.setPen(QPen(QColor("#c77827"), 0))
-        envelope.setBrush(QBrush(QColor(240, 166, 75, 85)))
+        envelope.setPen(QPen(QColor("#84a69d"), 0))
+        envelope.setBrush(QBrush(QColor(132, 166, 157, 92)))
         envelope.setZValue(50)
         self.view.scene.addItem(envelope)
         self.envelope_items.append(envelope)
@@ -622,6 +669,7 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("OpenArch Swept Paths")
+    app.setWindowIcon(QIcon(str(asset_path("app-icon.svg"))))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

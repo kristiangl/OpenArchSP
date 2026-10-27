@@ -20,4 +20,7 @@ openarchsp = "openarchsp.app:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+openarchsp = ["assets/*.svg", "assets/icons/*.svg"]
+
 
