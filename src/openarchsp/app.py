@@ -851,18 +851,24 @@ class MainWindow(QMainWindow):
         )
 
         if self.simulation_result is not None:
-            if "OASP_AXLE_PATHS" not in output.layers:
-                output.layers.new("OASP_AXLE_PATHS", dxfattribs={"color": 4})
-            if "OASP_WHEEL_PATHS" not in output.layers:
-                output.layers.new("OASP_WHEEL_PATHS", dxfattribs={"color": 94})
-            for unit in self.simulation_result.units:
+            axle_colors = (4, 5, 6, 3)
+            for unit_index, unit in enumerate(self.simulation_result.units, start=1):
+                axle_layer = f"OASP_AXLE_U{unit_index}"
+                wheel_layer = f"OASP_WHEEL_U{unit_index}"
+                if axle_layer not in output.layers:
+                    output.layers.new(
+                        axle_layer,
+                        dxfattribs={"color": axle_colors[(unit_index - 1) % len(axle_colors)]},
+                    )
+                if wheel_layer not in output.layers:
+                    output.layers.new(wheel_layer, dxfattribs={"color": 94})
                 for points in unit.axle_traces.values():
                     modelspace.add_lwpolyline(
                         [
                             (x * self.simulation_scale, y * self.simulation_scale)
                             for x, y in points
                         ],
-                        dxfattribs={"layer": "OASP_AXLE_PATHS"},
+                        dxfattribs={"layer": axle_layer},
                     )
                 for points in unit.wheel_traces.values():
                     modelspace.add_lwpolyline(
@@ -870,7 +876,7 @@ class MainWindow(QMainWindow):
                             (x * self.simulation_scale, y * self.simulation_scale)
                             for x, y in points
                         ],
-                        dxfattribs={"layer": "OASP_WHEEL_PATHS"},
+                        dxfattribs={"layer": wheel_layer},
                     )
 
         if self.envelope_geometry is not None:
