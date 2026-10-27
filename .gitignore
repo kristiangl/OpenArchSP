@@ -4,3 +4,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+build/
+dist/
+release-output/
+packaging/windows/output/

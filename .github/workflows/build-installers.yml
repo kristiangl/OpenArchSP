@@ -1,0 +1,179 @@
+name: Build installers
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            label: Windows x64
+            artifact_name: OpenArchSP-Windows-x64
+            artifact_path: release-output/*.exe
+            package: windows
+          - os: macos-15-intel
+            label: macOS Intel
+            artifact_name: OpenArchSP-macOS-Intel
+            artifact_path: release-output/*.dmg
+            package: macos
+          - os: macos-15
+            label: macOS Apple Silicon
+            artifact_name: OpenArchSP-macOS-Apple-Silicon
+            artifact_path: release-output/*.dmg
+            package: macos
+          - os: ubuntu-22.04
+            label: Linux x86_64
+            artifact_name: OpenArchSP-Linux-x86_64
+            artifact_path: release-output/*.AppImage
+            package: linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          with open("pyproject.toml", "rb") as project_file:
+              version = tomllib.load(project_file)["project"]["version"]
+
+          if os.environ.get("GITHUB_REF_TYPE") == "tag":
+              tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+              if tag_version != version:
+                  raise SystemExit(
+                      f"Release tag v{tag_version} does not match pyproject version {version}"
+                  )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+          PY
+
+      - name: Install app and packager
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+
+      - name: Bundle application
+        run: >-
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          --windowed
+          --name OpenArchSweptPaths
+          --paths src
+          --collect-all ezdxf
+          src/openarchsp/app.py
+
+      - name: Install Inno Setup
+        if: matrix.package == 'windows'
+        run: choco install innosetup --no-progress -y
+
+      - name: Create Windows installer
+        if: matrix.package == 'windows'
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $compiler "/DAppVersion=${{ steps.version.outputs.version }}" "packaging\windows\OpenArchSweptPaths.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Create macOS disk image
+        if: matrix.package == 'macos'
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          MAC_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-output dmg-root
+          ditto dist/OpenArchSweptPaths.app "dmg-root/OpenArch Swept Paths.app"
+          ln -s /Applications "dmg-root/Applications"
+          hdiutil create \
+            -volname "OpenArch Swept Paths" \
+            -srcfolder dmg-root \
+            -ov \
+            -format UDZO \
+            "release-output/OpenArch-Swept-Paths-${APP_VERSION}-macOS-${MAC_ARCH}.dmg"
+
+      - name: Create Linux AppImage
+        if: matrix.package == 'linux'
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p AppDir/usr/bin release-output
+          cp -a dist/OpenArchSweptPaths/. AppDir/usr/bin/
+          cp packaging/linux/openarch-swept-paths.desktop AppDir/
+          cp packaging/linux/openarch-swept-paths.svg AppDir/
+          ln -s openarch-swept-paths.svg AppDir/.DirIcon
+          cp packaging/linux/AppRun AppDir/AppRun
+          chmod +x AppDir/AppRun
+
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+            --output appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          ARCH=x86_64 ./appimagetool.AppImage --appimage-extract-and-run \
+            AppDir "release-output/OpenArch-Swept-Paths-${APP_VERSION}-Linux-x86_64.AppImage"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform installers
+        uses: actions/download-artifact@v7
+        with:
+          pattern: OpenArchSP-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish installers on the GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+
+

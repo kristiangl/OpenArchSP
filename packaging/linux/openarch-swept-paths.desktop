@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=OpenArch Swept Paths
+Exec=OpenArchSweptPaths
+Icon=openarch-swept-paths
+Type=Application
+Categories=Graphics;Engineering;
+Terminal=false

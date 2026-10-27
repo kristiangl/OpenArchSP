@@ -1,6 +1,16 @@
 # OpenArch Swept Paths
 
-OpenArch Swept Paths is a standalone desktop tool for checking vehicle swept paths against a site drawing. The first release uses DXF as its exchange format so drawings can be opened in CADCraft without requiring a CADCraft plugin API.
+OpenArch Swept Paths is a standalone desktop application built with Python, PySide6 (Qt) and ezdxf. The application is packaged separately on native Windows, macOS and Linux runners; PyInstaller does not cross-compile desktop binaries between operating systems.
+
+## Downloads
+
+- **Windows x64:** Install with the .exe setup program.
+- **macOS Intel and Apple Silicon:** Open the matching .dmg and drag the app into Applications. These builds are currently unsigned and not notarized, so macOS may require you to approve the app the first time it opens.
+- **Linux x86_64:** Make the .AppImage executable, then launch it. It is built on Ubuntu 22.04 and requires a compatible glibc-based Linux distribution.
+
+On every push to main, pull request, or manual workflow run, GitHub Actions builds all four platform packages. The files are downloadable from that run's Artifacts section for 14 days. To publish permanent downloads under Releases, update the version in pyproject.toml, push a matching version tag such as v0.1.1, and wait for the workflow to finish.
+
+The GitHub-hosted build matrix creates Windows x64, macOS Intel, macOS Apple Silicon and Linux x86_64 packages. The macOS builds are separate because PyInstaller packages for the architecture on which it runs.
 
 ## Current workflow
 
@@ -28,7 +38,7 @@ PowerShell:
 
 On macOS or Linux, activate the environment with source .venv/bin/activate.
 
-## Planned next
+## Swept-path roadmap
 
 - Australian design-vehicle library with editable and source-attributed dimensions.
 - Turning and articulated-vehicle kinematics, followed by swept-envelope rendering.

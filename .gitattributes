@@ -1,0 +1,5 @@
+*.yml text eol=lf
+*.sh text eol=lf
+*.desktop text eol=lf
+*.svg text eol=lf
+packaging/linux/AppRun text eol=lf
