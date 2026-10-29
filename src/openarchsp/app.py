@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 import uuid
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import ezdxf
 from shapely.affinity import scale as scale_geometry
-from PySide6.QtCore import QSettings, QSize, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGraphicsEllipseItem,
+    QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsScene,
     QGraphicsView,
@@ -81,6 +83,7 @@ def action_icon(name: str) -> QIcon:
 
 class DrawingView(QGraphicsView):
     worldClicked = Signal(float, float)
+    worldMoved = Signal(float, float)
     finishRequested = Signal()
 
     def __init__(self) -> None:
@@ -90,6 +93,7 @@ class DrawingView(QGraphicsView):
         self.setScene(self.scene)
         self.setBackgroundBrush(Qt.GlobalColor.white)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setMouseTracking(True)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -114,12 +118,84 @@ class DrawingView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event: object) -> None:
+        if self.drawing_mode:
+            point = self.mapToScene(event.position().toPoint())
+            self.worldMoved.emit(point.x(), -point.y())
+        super().mouseMoveEvent(event)
+
     def keyPressEvent(self, event: object) -> None:
         if event.key() == Qt.Key.Key_Escape and self.drawing_mode:
             self.finishRequested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class _PreviewSignals(QObject):
+    finished = Signal(int, object, str)
+
+
+class _PreviewWorker(QRunnable):
+    """Calculate one drawing preview without blocking mouse interaction."""
+
+    def __init__(
+        self,
+        token: int,
+        route: list[tuple[float, float]],
+        geometry: CombinationGeometry | None,
+        *,
+        scale: float,
+        corner_radius_m: float,
+        spacing_m: float,
+        speed_kmh: float,
+        lock_to_lock_s: float,
+        rigid_length: float,
+        rigid_width: float,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.route = route
+        self.geometry = geometry
+        self.scale = scale
+        self.corner_radius_m = corner_radius_m
+        self.spacing_m = spacing_m
+        self.speed_kmh = speed_kmh
+        self.lock_to_lock_s = lock_to_lock_s
+        self.rigid_length = rigid_length
+        self.rigid_width = rigid_width
+        self.signals = _PreviewSignals()
+
+    def run(self) -> None:
+        try:
+            if self.geometry is not None:
+                route_metres = [(x / self.scale, y / self.scale) for x, y in self.route]
+                result = simulate_combination(
+                    route_metres,
+                    self.geometry,
+                    corner_radius_m=self.corner_radius_m,
+                    spacing_m=self.spacing_m,
+                    speed_kmh=self.speed_kmh,
+                    lock_to_lock_s=self.lock_to_lock_s,
+                )
+                envelope = scale_geometry(
+                    result.envelope,
+                    xfact=self.scale,
+                    yfact=self.scale,
+                    origin=(0, 0),
+                )
+                payload = (result, envelope)
+            else:
+                envelope = swept_footprint(
+                    self.route,
+                    self.rigid_length * self.scale,
+                    self.rigid_width * self.scale,
+                    max(0.25 * self.scale, 1e-6),
+                )
+                payload = (None, envelope)
+            self.signals.finished.emit(self.token, payload, "")
+        except Exception as error:
+            self.signals.finished.emit(self.token, None, str(error))
 
 
 class GeometryDialog(QDialog):
@@ -440,11 +516,19 @@ class MainWindow(QMainWindow):
         self._converted_base_path: Path | None = None
         self.route_points: list[tuple[float, float]] = []
         self.route_items: list[object] = []
+        self.hover_items: list[object] = []
         self.trace_items: list[object] = []
         self.envelope_items: list[object] = []
         self.envelope_geometry = None
         self.simulation_result: SimulationResult | None = None
         self.simulation_scale = 1.0
+        self._hover_point: tuple[float, float] | None = None
+        self._preview_validity = "pending"
+        self._preview_generation = 0
+        self._preview_running = False
+        self._preview_show_errors = False
+        self.preview_pool = QThreadPool(self)
+        self.preview_pool.setMaxThreadCount(1)
         self.vehicle_geometries = self._load_vehicle_geometries()
         self._last_vehicle_geometry_mode: bool | None = None
 
@@ -452,6 +536,7 @@ class MainWindow(QMainWindow):
         self.view = DrawingView()
         self.setCentralWidget(self.view)
         self.view.worldClicked.connect(self.add_route_point)
+        self.view.worldMoved.connect(self.update_hover_point)
         self.view.finishRequested.connect(self.finish_route)
 
         self._build_vehicle_panel()
@@ -466,7 +551,7 @@ class MainWindow(QMainWindow):
         self.lock_to_lock_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
-        self.preview_timer.setInterval(180)
+        self.preview_timer.setInterval(65)
         self.preview_timer.timeout.connect(self._preview_current_route)
 
         self.status = QStatusBar()
@@ -651,6 +736,8 @@ class MainWindow(QMainWindow):
             self.load_drawing(filename)
 
     def load_drawing(self, filename: str) -> None:
+        self.preview_timer.stop()
+        self._preview_generation += 1
         path = Path(filename)
         new_tempdir: tempfile.TemporaryDirectory[str] | None = None
         converted_path: Path | None = None
@@ -677,11 +764,13 @@ class MainWindow(QMainWindow):
         self.drawing_path = path
         # draw_document() clears the scene, which also destroys existing overlay items.
         self.route_items.clear()
+        self.hover_items.clear()
         self.trace_items.clear()
         self.envelope_items.clear()
         self.envelope_geometry = None
         self.simulation_result = None
         self.route_points.clear()
+        self._hover_point = None
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
         unit_code = int(document.header.get("$INSUNITS", 0) or 0)
@@ -782,12 +871,39 @@ class MainWindow(QMainWindow):
         self._queue_live_preview()
 
     def _queue_live_preview(self) -> None:
-        if len(self.route_points) >= 2 and self.document is not None:
+        self._preview_generation += 1
+        self._preview_show_errors = False
+        if len(self._current_preview_route()) >= 2 and self.document is not None:
             self.preview_timer.start()
+        else:
+            self.preview_timer.stop()
+        self._update_export_state()
 
     def _preview_current_route(self) -> None:
-        if len(self.route_points) >= 2:
-            self.calculate_envelope(show_errors=False)
+        route = self._current_preview_route()
+        if len(route) >= 2 and not self._preview_running:
+            self._start_preview(route, self._preview_generation)
+
+    def _current_preview_route(self) -> list[tuple[float, float]]:
+        route = list(self.route_points)
+        if (
+            self.view.drawing_mode
+            and self._hover_point is not None
+            and (not route or math.dist(route[-1], self._hover_point) > 1e-6)
+        ):
+            route.append(self._hover_point)
+        return route
+
+    def update_hover_point(self, scene_x: float, scene_y: float) -> None:
+        if not self.view.drawing_mode:
+            return
+        point = (scene_x, scene_y)
+        if self._hover_point is not None and math.dist(self._hover_point, point) < 1e-5:
+            return
+        self._hover_point = point
+        self._preview_validity = "pending"
+        self._render_hover_cursor()
+        self._queue_live_preview()
 
     def _route_label(self) -> str:
         if self._selected_vehicle().id in self.vehicle_geometries:
@@ -856,14 +972,22 @@ class MainWindow(QMainWindow):
                 else "body-centre path"
             )
             self.status.showMessage(
-                f"Click {path_name} points · swept preview updates after each click · "
+                f"Move the cursor to preview the next {path_name} point, then click to add it · "
                 "Right-click or Enter to finish · Esc to stop drawing"
             )
         else:
+            self._preview_generation += 1
+            self._hover_point = None
+            self._render_hover_cursor()
             self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self.status.showMessage("Path edit mode off · Wheel zooms · Drag pans")
+        self._update_export_state()
+        if not enabled:
+            self._queue_live_preview()
 
     def add_route_point(self, scene_x: float, scene_y: float) -> None:
+        self._hover_point = None
+        self._render_hover_cursor()
         self.route_points.append((scene_x, scene_y))
         self._clear_envelope()
         self._render_route()
@@ -878,6 +1002,8 @@ class MainWindow(QMainWindow):
         if len(self.route_points) < 2:
             self.status.showMessage("Add at least two points to define a path")
         else:
+            self._preview_generation += 1
+            self._preview_show_errors = False
             self.calculate_envelope(show_errors=False)
             if self.simulation_result is None and self.envelope_geometry is None:
                 self.status.showMessage(
@@ -896,10 +1022,15 @@ class MainWindow(QMainWindow):
 
     def clear_route(self) -> None:
         self.preview_timer.stop()
+        self._preview_generation += 1
+        self._hover_point = None
+        self._render_hover_cursor()
         self.route_points.clear()
         self._clear_envelope()
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
+        self.preview_timer.stop()
+        self._preview_generation += 1
         self._render_route()
         self._update_export_state()
         self.status.showMessage("Reference path cleared")
@@ -947,10 +1078,60 @@ class MainWindow(QMainWindow):
             self.view.scene.addItem(marker)
             self.route_items.append(marker)
 
+    def _render_hover_cursor(self) -> None:
+        for item in self.hover_items:
+            self.view.scene.removeItem(item)
+        self.hover_items.clear()
+        if not self.view.drawing_mode or self._hover_point is None:
+            return
+
+        x, y = self._hover_point
+        if self.route_points:
+            path = QPainterPath()
+            last_x, last_y = self.route_points[-1]
+            path.moveTo(last_x, -last_y)
+            path.lineTo(x, -y)
+            pen = QPen(QColor("#9eaaa6"))
+            pen.setCosmetic(True)
+            pen.setWidthF(1.4)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            segment = QGraphicsPathItem(path)
+            segment.setPen(pen)
+            segment.setZValue(102)
+            self.view.scene.addItem(segment)
+            self.hover_items.append(segment)
+
+        half = 9.0
+        cross = QPainterPath()
+        cross.moveTo(-half, -half)
+        cross.lineTo(half, half)
+        cross.moveTo(-half, half)
+        cross.lineTo(half, -half)
+        color = {
+            "valid": "#238b70",
+            "invalid": "#d94740",
+            "pending": "#c69332",
+        }.get(self._preview_validity, "#c69332")
+        pen = QPen(QColor(color))
+        pen.setCosmetic(True)
+        pen.setWidthF(2.6)
+        marker = QGraphicsPathItem(cross)
+        marker.setPos(x, -y)
+        marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        marker.setPen(pen)
+        marker.setZValue(110)
+        marker.setToolTip(
+            "Candidate path point · "
+            + ("physically unreachable" if self._preview_validity == "invalid" else self._preview_validity)
+        )
+        self.view.scene.addItem(marker)
+        self.hover_items.append(marker)
+
     def calculate_envelope(
         self, _checked: bool = False, *, show_errors: bool = True
     ) -> None:
-        if len(self.route_points) < 2:
+        route = self._current_preview_route()
+        if len(route) < 2:
             return
         vehicle = self._selected_vehicle()
         geometry = self.vehicle_geometries.get(vehicle.id)
@@ -961,76 +1142,110 @@ class MainWindow(QMainWindow):
             else:
                 self.status.showMessage(f"Preview unavailable · {message}")
             return
+        self.preview_timer.stop()
+        self._preview_generation += 1
+        self._preview_show_errors = show_errors
+        self._start_preview(route, self._preview_generation)
 
+    def _start_preview(self, route: list[tuple[float, float]], token: int) -> None:
+        if self._preview_running:
+            return
+        vehicle = self._selected_vehicle()
+        geometry = self.vehicle_geometries.get(vehicle.id)
+        if geometry is None and not vehicle.supports_preview:
+            self._preview_validity = "invalid"
+            self._render_hover_cursor()
+            self.status.showMessage("Preview unavailable · vehicle geometry is required")
+            return
         scale = self.units_spin.value()
+        run_geometry = (
+            replace(geometry, max_steer_deg=self.steering_limit_spin.value())
+            if geometry is not None
+            else None
+        )
         self._clear_envelope()
-        try:
-            if geometry is not None:
-                run_geometry = replace(
-                    geometry, max_steer_deg=self.steering_limit_spin.value()
+        worker = _PreviewWorker(
+            token,
+            route,
+            run_geometry,
+            scale=scale,
+            corner_radius_m=self.corner_radius_spin.value(),
+            spacing_m=0.25,
+            speed_kmh=self.speed_spin.value(),
+            lock_to_lock_s=self.lock_to_lock_spin.value(),
+            rigid_length=self.length_spin.value(),
+            rigid_width=self.width_spin.value(),
+        )
+        worker.signals.finished.connect(self._preview_completed)
+        self._preview_running = True
+        self._update_export_state()
+        self.preview_pool.start(worker)
+
+    def _preview_completed(self, token: int, payload: object, error: str) -> None:
+        self._preview_running = False
+        self._update_export_state()
+        if token != self._preview_generation:
+            if len(self._current_preview_route()) >= 2:
+                self.preview_timer.start(0)
+                self._update_export_state()
+            return
+
+        if error:
+            self._clear_envelope()
+            self._preview_validity = "invalid"
+            self._render_hover_cursor()
+            self.status.showMessage(f"Candidate path is unreachable · {error}")
+            if self._preview_show_errors:
+                QMessageBox.warning(self, "Could not calculate preview", error)
+        else:
+            result, envelope = payload
+            self.envelope_geometry = envelope
+            self._render_envelope(envelope)
+            if result is None:
+                self.simulation_result = None
+                vehicle = self._selected_vehicle()
+                self.status.showMessage(
+                    f"Rigid-body footprint preview · {vehicle.name} · "
+                    f"{self.length_spin.value():.2f} m × {self.width_spin.value():.2f} m"
                 )
-                route_metres = [
-                    (x / scale, y / scale) for x, y in self.route_points
-                ]
-                result = simulate_combination(
-                    route_metres,
-                    run_geometry,
-                    corner_radius_m=self.corner_radius_spin.value(),
-                    spacing_m=0.25,
-                    speed_kmh=self.speed_spin.value(),
-                    lock_to_lock_s=self.lock_to_lock_spin.value(),
-                )
+                self._preview_validity = "valid"
+            else:
                 self.simulation_result = result
-                self.simulation_scale = scale
-                self.envelope_geometry = scale_geometry(
-                    result.envelope, xfact=scale, yfact=scale, origin=(0, 0)
-                )
-                self._render_simulation_traces(result, scale)
-                self._render_envelope(self.envelope_geometry)
+                self.simulation_scale = self.units_spin.value()
+                geometry = self.vehicle_geometries[self._selected_vehicle().id]
+                self._render_simulation_traces(result, geometry, self.simulation_scale)
+                self._render_current_vehicle(result, geometry, self.simulation_scale)
                 max_steer = max(abs(value) for value in result.steering_angles_deg)
                 max_wheel_steer = max(
                     (abs(angle) for pair in result.front_wheel_angles_deg for angle in pair),
                     default=0.0,
                 )
                 max_offtracking = max(result.offtracking_by_axle_m.values(), default=0.0)
-                simulation_note = (
-                    " · steering actuator saturated"
-                    if result.steering_rate_saturated
-                    else ""
+                reachable = (
+                    result.path_complete
+                    and not result.steering_rate_saturated
+                    and result.maximum_articulation_deg <= geometry.max_articulation_deg
+                    and result.maximum_path_error_m <= max(0.5, self.corner_radius_spin.value() * 0.1)
                 )
-                if not result.path_complete:
-                    simulation_note += " · target path not completed"
+                self._preview_validity = "valid" if reachable else "invalid"
+                state = "" if reachable else " · candidate exceeds steering/path limits"
                 self.status.showMessage(
                     f"Swept path preview · {geometry.name} · "
                     f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
                     f"axle off-tracking {max_offtracking:.2f} m · "
                     f"articulation {result.maximum_articulation_deg:.1f}° · "
                     f"steering rate {result.max_steering_rate_deg_s:.1f}°/s · "
-                    f"target path error {result.maximum_path_error_m:.2f} m{simulation_note}"
+                    f"target path error {result.maximum_path_error_m:.2f} m{state}"
                 )
-                return
+            self._render_hover_cursor()
 
-            result = swept_footprint(
-                self.route_points,
-                self.length_spin.value() * scale,
-                self.width_spin.value() * scale,
-                max(0.25 * scale, 1e-6),
-            )
-        except Exception as error:
-            if show_errors:
-                QMessageBox.warning(self, "Could not calculate preview", str(error))
-            else:
-                self.status.showMessage(f"Live preview unavailable · {error}")
-            return
+        if token != self._preview_generation and len(self._current_preview_route()) >= 2:
+            self.preview_timer.start(0)
+            self._update_export_state()
 
-        self.envelope_geometry = result
-        self._render_envelope(result)
-        self.status.showMessage(
-            f"Rigid-body footprint preview · {vehicle.name} · "
-            f"{self.length_spin.value():.2f} m × {self.width_spin.value():.2f} m"
-        )
-
-    def _render_simulation_traces(self, result: SimulationResult, scale: float) -> None:
+    def _render_simulation_traces(
+        self, result: SimulationResult, geometry: CombinationGeometry, scale: float
+    ) -> None:
         colors = ("#1a1a1a", "#627f77", "#8b7560", "#6c7f94")
 
         def add_trace(
@@ -1062,10 +1277,143 @@ class MainWindow(QMainWindow):
         add_trace(result.steer_axle_path, "#1a1a1a", 2.4)
         for unit_index, unit in enumerate(result.units):
             color = colors[unit_index % len(colors)]
+            unit_geometry = geometry.units[unit_index]
+            for longitudinal in (
+                unit_geometry.front_extent_m,
+                -unit_geometry.rear_extent_m,
+            ):
+                for side in (-1, 1):
+                    edge = []
+                    for reference, heading in zip(
+                        unit.reference_points, unit.headings_rad
+                    ):
+                        forward = (math.cos(heading), math.sin(heading))
+                        normal = (-math.sin(heading), math.cos(heading))
+                        edge.append(
+                            (
+                                reference[0] + forward[0] * longitudinal + normal[0] * side * unit_geometry.width_m / 2,
+                                reference[1] + forward[1] * longitudinal + normal[1] * side * unit_geometry.width_m / 2,
+                            )
+                        )
+                    add_trace(edge, color, 1.0)
             for axle_path in unit.axle_traces.values():
                 add_trace(axle_path, color, 1.3)
             for wheel_path in unit.wheel_traces.values():
                 add_trace(wheel_path, "#84a69d", 0.8)
+
+    def _render_current_vehicle(
+        self, result: SimulationResult, geometry: CombinationGeometry, scale: float
+    ) -> None:
+        colors = ("#24483f", "#665444", "#405a75", "#6f526e")
+        final_poses: list[tuple[tuple[float, float], float]] = []
+        for unit_index, (trajectory, unit_geometry) in enumerate(
+            zip(result.units, geometry.units)
+        ):
+            reference = trajectory.reference_points[-1]
+            heading = trajectory.headings_rad[-1]
+            final_poses.append((reference, heading))
+            forward = (math.cos(heading), math.sin(heading))
+            normal = (-math.sin(heading), math.cos(heading))
+
+            def world(longitudinal: float, lateral: float) -> tuple[float, float]:
+                return (
+                    reference[0] + forward[0] * longitudinal + normal[0] * lateral,
+                    reference[1] + forward[1] * longitudinal + normal[1] * lateral,
+                )
+
+            outline = QPainterPath()
+            corners = [
+                world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
+                world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
+                world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
+                world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
+            ]
+            outline.moveTo(corners[0][0] * scale, -corners[0][1] * scale)
+            for x, y in corners[1:]:
+                outline.lineTo(x * scale, -y * scale)
+            outline.closeSubpath()
+            body = QGraphicsPathItem(outline)
+            body_color = QColor(colors[unit_index % len(colors)])
+            body_color.setAlpha(62)
+            body.setBrush(QBrush(body_color))
+            pen = QPen(QColor(colors[unit_index % len(colors)]))
+            pen.setCosmetic(True)
+            pen.setWidthF(2.0)
+            body.setPen(pen)
+            body.setZValue(62)
+            body.setToolTip(unit_geometry.name)
+            self.view.scene.addItem(body)
+            self.trace_items.append(body)
+
+            steer_angles = (0.0, 0.0)
+            if unit_index == 0 and result.front_wheel_angles_deg:
+                steer_angles = result.front_wheel_angles_deg[-1]
+            for axle_offset in unit_geometry.axle_offsets_m:
+                is_steer_axle = (
+                    unit_index == 0
+                    and math.isclose(axle_offset, geometry.steer_axle_m, abs_tol=1e-6)
+                )
+                for side, steer_angle in zip((1, -1), steer_angles):
+                    wheel_heading = heading + (math.radians(steer_angle) if is_steer_axle else 0.0)
+                    wheel_forward = (math.cos(wheel_heading), math.sin(wheel_heading))
+                    wheel_center = world(axle_offset, side * unit_geometry.track_m / 2)
+                    half_length = 0.48
+                    half_width = 0.12
+                    wheel_normal = (-wheel_forward[1], wheel_forward[0])
+                    wheel_corners = [
+                        (
+                            wheel_center[0] + wheel_forward[0] * longitudinal + wheel_normal[0] * lateral,
+                            wheel_center[1] + wheel_forward[1] * longitudinal + wheel_normal[1] * lateral,
+                        )
+                        for longitudinal, lateral in (
+                            (half_length, half_width),
+                            (half_length, -half_width),
+                            (-half_length, -half_width),
+                            (-half_length, half_width),
+                        )
+                    ]
+                    wheel_path = QPainterPath()
+                    wheel_path.moveTo(wheel_corners[0][0] * scale, -wheel_corners[0][1] * scale)
+                    for x, y in wheel_corners[1:]:
+                        wheel_path.lineTo(x * scale, -y * scale)
+                    wheel_path.closeSubpath()
+                    wheel = QGraphicsPathItem(wheel_path)
+                    wheel.setBrush(QBrush(QColor("#252a28")))
+                    wheel.setPen(QPen(QColor("#f7f5ef"), 0))
+                    wheel.setZValue(64)
+                    wheel_label = f"{unit_geometry.name} wheel"
+                    if is_steer_axle:
+                        wheel_label += f" · {steer_angle:.1f}° steer"
+                    wheel.setToolTip(wheel_label)
+                    self.view.scene.addItem(wheel)
+                    self.trace_items.append(wheel)
+
+        # Draw each live coupling between the actual tractor and trailer poses.
+        for index in range(1, len(final_poses)):
+            towing_reference, towing_heading = final_poses[index - 1]
+            trailer_reference, trailer_heading = final_poses[index]
+            towing_geometry = geometry.units[index - 1]
+            trailer_geometry = geometry.units[index]
+            towing_point = (
+                towing_reference[0] - math.cos(towing_heading) * towing_geometry.rear_hitch_m,
+                towing_reference[1] - math.sin(towing_heading) * towing_geometry.rear_hitch_m,
+            )
+            trailer_point = (
+                trailer_reference[0] + math.cos(trailer_heading) * trailer_geometry.front_hitch_m,
+                trailer_reference[1] + math.sin(trailer_heading) * trailer_geometry.front_hitch_m,
+            )
+            coupling = QPainterPath()
+            coupling.moveTo(towing_point[0] * scale, -towing_point[1] * scale)
+            coupling.lineTo(trailer_point[0] * scale, -trailer_point[1] * scale)
+            pen = QPen(QColor("#d97732"))
+            pen.setCosmetic(True)
+            pen.setWidthF(2.0)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            coupling_item = QGraphicsPathItem(coupling)
+            coupling_item.setPen(pen)
+            coupling_item.setZValue(63)
+            self.view.scene.addItem(coupling_item)
+            self.trace_items.append(coupling_item)
 
     def _render_envelope(self, geometry: object) -> None:
         path = QPainterPath()
@@ -1094,7 +1442,13 @@ class MainWindow(QMainWindow):
         path.closeSubpath()
 
     def _update_export_state(self) -> None:
-        has_path = self.document is not None and len(self.route_points) >= 2
+        has_path = (
+            self.document is not None
+            and len(self.route_points) >= 2
+            and not self.view.drawing_mode
+            and not self._preview_running
+            and not self.preview_timer.isActive()
+        )
         self.export_action.setEnabled(has_path)
         self.save_copy_action.setEnabled(has_path)
         vehicle = self._selected_vehicle()
