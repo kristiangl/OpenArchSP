@@ -99,7 +99,7 @@ def draw_document(document: Drawing, scene: QGraphicsScene) -> tuple[int, QRectF
     scene.clear()
     bounds = QRectF()
     rendered = 0
-    pen = QPen(QColor("#334155"))
+    pen = QPen(QColor("#89939e"))
     pen.setCosmetic(True)
     pen.setWidthF(0.0)
 

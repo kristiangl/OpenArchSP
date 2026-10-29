@@ -7,8 +7,8 @@ import math
 import sys
 import tempfile
 import uuid
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import ezdxf
@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
+    QFont,
     QPen,
 )
 from PySide6.QtSvg import QSvgRenderer
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QHeaderView,
     QInputDialog,
@@ -89,24 +91,32 @@ class DrawingView(QGraphicsView):
     def __init__(self) -> None:
         super().__init__()
         self.drawing_mode = False
+        self._pan_position = None
         self.scene = QGraphicsScene(self)
+        self.drawing_bounds = None
         self.setScene(self.scene)
-        self.setBackgroundBrush(Qt.GlobalColor.white)
+        self.setBackgroundBrush(QColor("#1b1d20"))
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setMouseTracking(True)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
     def fit_drawing(self) -> None:
         if self.scene.items():
-            self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            bounds = self.drawing_bounds or self.scene.sceneRect()
+            self.fitInView(bounds, Qt.AspectRatioMode.KeepAspectRatio)
 
     def wheelEvent(self, event: object) -> None:
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
         self.scale(factor, factor)
 
     def mousePressEvent(self, event: object) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_position = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if self.drawing_mode and event.button() == Qt.MouseButton.LeftButton:
             point = self.mapToScene(event.position().toPoint())
             self.worldClicked.emit(point.x(), -point.y())
@@ -119,10 +129,26 @@ class DrawingView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: object) -> None:
-        if self.drawing_mode:
+        if self.drawing_mode and self._pan_position is None:
             point = self.mapToScene(event.position().toPoint())
             self.worldMoved.emit(point.x(), -point.y())
+        if self._pan_position is not None:
+            current = event.position().toPoint()
+            delta = current - self._pan_position
+            self._pan_position = current
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: object) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton and self._pan_position is not None:
+            self._pan_position = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: object) -> None:
         if event.key() == Qt.Key.Key_Escape and self.drawing_mode:
@@ -200,6 +226,53 @@ class _PreviewWorker(QRunnable):
             self.signals.finished.emit(self.token, payload, "")
         except Exception as error:
             self.signals.finished.emit(self.token, None, str(error))
+
+
+@dataclass
+class SweptPathDocument:
+    id: str
+    name: str
+    vehicle_id: str
+    color: str
+    points: list[tuple[float, float]]
+    simulation_result: SimulationResult | None = None
+    envelope_geometry: object | None = None
+    simulation_scale: float = 1.0
+
+
+class WaypointItem(QGraphicsEllipseItem):
+    """Screen-sized draggable route handle."""
+
+    def __init__(
+        self,
+        index: int,
+        point: tuple[float, float],
+        color: str,
+        moved_callback: Callable[[int, float, float, bool], None],
+    ) -> None:
+        super().__init__(-7, -7, 14, 14)
+        self.index = index
+        self.moved_callback = moved_callback
+        self.setPos(point[0], -point[1])
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setBrush(QColor(color))
+        pen = QPen(QColor("#e7eaed"))
+        pen.setCosmetic(True)
+        pen.setWidthF(1.4)
+        self.setPen(pen)
+        self.setZValue(101)
+        self.setToolTip(f"Waypoint {index + 1} · drag to move")
+
+    def mouseReleaseEvent(self, event: object) -> None:
+        super().mouseReleaseEvent(event)
+        index, x, y = self.index, self.pos().x(), -self.pos().y()
+        QTimer.singleShot(0, lambda: self.moved_callback(index, x, y, False))
+
+    def mouseMoveEvent(self, event: object) -> None:
+        super().mouseMoveEvent(event)
+        self.moved_callback(self.index, self.pos().x(), -self.pos().y(), True)
 
 
 class GeometryDialog(QDialog):
@@ -501,25 +574,49 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
         self.setWindowIcon(QIcon(str(asset_path("app-icon.svg"))))
         self.setStyleSheet(
-            "QMainWindow { background: #f0efeb; }"
-            "QToolBar { background: #f0efeb; border: 0; border-bottom: 1px solid #d7d4ce; "
-            "spacing: 8px; padding: 6px; }"
-            "QToolButton { color: #1a1a1a; padding: 5px 8px; border-radius: 5px; }"
-            "QToolButton:hover { background: #e5e4df; }"
-            "QToolButton:checked { background: #84a69d; }"
-            "QDockWidget::title { background: #84a69d; color: #1a1a1a; "
+            "QWidget { background: #24272b; color: #d8dde3; }"
+            "QMainWindow { background: #1b1d20; }"
+            "QMenuBar, QMenu { background: #24272b; color: #d8dde3; }"
+            "QMenuBar::item:selected, QMenu::item:selected { background: #3a4148; }"
+            "QToolBar { background: #24272b; border: 0; border-bottom: 1px solid #111315; "
+            "spacing: 6px; padding: 5px; }"
+            "QToolButton { color: #d8dde3; padding: 5px 8px; border-radius: 4px; }"
+            "QToolButton:hover { background: #3a4148; }"
+            "QToolButton:checked { background: #3d7165; color: #f1f4f2; }"
+            "QDockWidget { color: #d8dde3; }"
+            "QDockWidget::title { background: #30363c; color: #e5e8eb; "
             "padding: 7px; font-weight: 600; }"
-            "QComboBox, QDoubleSpinBox, QPushButton { padding: 5px; }"
-            "QPushButton { background: #f28583; color: #1a1a1a; border: 0; "
-            "border-radius: 4px; font-weight: 600; }"
-            "QPushButton:hover { background: #ed7775; }"
+            "QComboBox, QDoubleSpinBox, QLineEdit, QTableWidget { background: #181a1d; "
+            "color: #e1e5e9; border: 1px solid #454b52; border-radius: 3px; padding: 5px; }"
+            "QPushButton { background: #383e45; color: #e1e5e9; border: 1px solid #515860; "
+            "border-radius: 4px; padding: 6px 9px; }"
+            "QPushButton:hover { background: #48515a; }"
+            "QHeaderView::section { background: #30363c; color: #d8dde3; padding: 5px; "
+            "border: 1px solid #454b52; }"
+            "QStatusBar { background: #24272b; color: #b9c0c7; }"
+            "QScrollBar:vertical, QScrollBar:horizontal { background: #1b1d20; width: 12px; height: 12px; }"
+            "QScrollBar::handle { background: #4b535b; border-radius: 5px; min-height: 22px; }"
         )
         self.document = None
         self.drawing_path: Path | None = None
         self._dwg_tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._converted_base_path: Path | None = None
-        self.route_points: list[tuple[float, float]] = []
+        self.vehicle_definitions = self._load_vehicle_definitions()
+        first_vehicle_id = next(iter(self.vehicle_definitions))
+        self.swept_paths = [
+            SweptPathDocument(
+                uuid.uuid4().hex,
+                "Swept path 1",
+                first_vehicle_id,
+                "#f28583",
+                [],
+            )
+        ]
+        self.active_path_id = self.swept_paths[0].id
+        self._path_switching = False
         self.route_items: list[object] = []
+        self.route_line_item: QGraphicsPathItem | None = None
+        self.other_path_items: list[object] = []
         self.hover_items: list[object] = []
         self.trace_items: list[object] = []
         self.envelope_items: list[object] = []
@@ -537,7 +634,6 @@ class MainWindow(QMainWindow):
         self.vehicle_geometries = self._load_vehicle_geometries()
         self._last_vehicle_geometry_mode: bool | None = None
 
-        self.vehicle_definitions = self._load_vehicle_definitions()
         self.view = DrawingView()
         self.setCentralWidget(self.view)
         self.view.worldClicked.connect(self.add_route_point)
@@ -563,6 +659,103 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Open a DXF or DWG site drawing to begin")
         self.setStatusBar(self.status)
         self._vehicle_selected()
+
+    @property
+    def active_path(self) -> SweptPathDocument:
+        return next(path for path in self.swept_paths if path.id == self.active_path_id)
+
+    @property
+    def route_points(self) -> list[tuple[float, float]]:
+        return self.active_path.points
+
+    def _refresh_path_picker(self) -> None:
+        self.path_combo.blockSignals(True)
+        self.path_combo.clear()
+        for path in self.swept_paths:
+            self.path_combo.addItem(path.name, path.id)
+        index = self.path_combo.findData(self.active_path_id)
+        if index >= 0:
+            self.path_combo.setCurrentIndex(index)
+        self.path_combo.blockSignals(False)
+
+    def new_swept_path(self) -> None:
+        number = len(self.swept_paths) + 1
+        colors = ("#f28583", "#70b7d3", "#d0a45b", "#a590cf", "#7fbd91", "#da7da8")
+        path = SweptPathDocument(
+            uuid.uuid4().hex,
+            f"Swept path {number}",
+            str(self.vehicle_combo.currentData()),
+            colors[(number - 1) % len(colors)],
+            [],
+        )
+        self.swept_paths.append(path)
+        self._refresh_path_picker()
+        self.path_combo.setCurrentIndex(self.path_combo.findData(path.id))
+
+    def rename_swept_path(self) -> None:
+        path = self.active_path
+        name, accepted = QInputDialog.getText(
+            self, "Rename swept path", "Path name:", text=path.name
+        )
+        if not accepted or not name.strip():
+            return
+        path.name = name.strip()
+        self._refresh_path_picker()
+        self._render_other_paths()
+
+    def remove_swept_path(self) -> None:
+        if len(self.swept_paths) == 1:
+            self.clear_route()
+            return
+        self.swept_paths = [path for path in self.swept_paths if path.id != self.active_path_id]
+        self._refresh_path_picker()
+        self._path_selection_changed(0)
+
+    def _path_selection_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        path_id = str(self.path_combo.itemData(index))
+        if not path_id or path_id == self.active_path_id:
+            return
+        self.preview_timer.stop()
+        self._preview_generation += 1
+        self._hover_point = None
+        self.view.drawing_mode = False
+        self.finish_action.setEnabled(False)
+        self.draw_action.setChecked(False)
+        self._render_hover_cursor()
+        for item in self.route_items:
+            self.view.scene.removeItem(item)
+        self.route_items.clear()
+        self.route_line_item = None
+        self._clear_envelope(clear_record=False)
+        self.active_path_id = path_id
+        self._path_switching = True
+        vehicle_index = self.vehicle_combo.findData(self.active_path.vehicle_id)
+        if vehicle_index >= 0:
+            self.vehicle_combo.setCurrentIndex(vehicle_index)
+        self._vehicle_selected()
+        self._path_switching = False
+        self._render_route()
+        self._render_other_paths()
+        if self.active_path.simulation_result and self.active_path.envelope_geometry is not None:
+            self.simulation_result = self.active_path.simulation_result
+            self.envelope_geometry = self.active_path.envelope_geometry
+            self.simulation_scale = self.active_path.simulation_scale
+            self._render_envelope(self.envelope_geometry)
+            self._render_simulation_traces(
+                self.simulation_result,
+                self.vehicle_geometries[self.active_path.vehicle_id],
+                self.simulation_scale,
+            )
+            self._render_current_vehicle(
+                self.simulation_result,
+                self.vehicle_geometries[self.active_path.vehicle_id],
+                self.simulation_scale,
+            )
+        elif len(self.route_points) >= 2 and self.document is not None:
+            self._queue_live_preview()
+        self._update_export_state()
 
     def _load_vehicle_definitions(self) -> dict[str, VehicleDefinition]:
         definitions = {vehicle.id: vehicle for vehicle in STANDARD_VEHICLES}
@@ -638,7 +831,7 @@ class MainWindow(QMainWindow):
 
         self.vehicle_note_label = QLabel()
         self.vehicle_note_label.setWordWrap(True)
-        self.vehicle_note_label.setStyleSheet("color: #6b5a3e;")
+        self.vehicle_note_label.setStyleSheet("color: #c1ad83;")
         form.addRow(self.vehicle_note_label)
 
         self.save_vehicle_button = QPushButton("Save dimensions as custom vehicle…")
@@ -673,13 +866,13 @@ class MainWindow(QMainWindow):
         self.open_action.triggered.connect(self.open_dxf)
         file_menu.addAction(self.open_action)
 
-        self.export_action = QAction("Export path and envelope as DXF…", self)
+        self.export_action = QAction("Export swept paths as DXF…", self)
         self.export_action.setIcon(action_icon("export"))
         self.export_action.triggered.connect(self.export_path)
         self.export_action.setEnabled(False)
         file_menu.addAction(self.export_action)
 
-        self.save_copy_action = QAction("Save drawing copy with path and envelope as…", self)
+        self.save_copy_action = QAction("Save drawing copy with swept paths as…", self)
         self.save_copy_action.setIcon(action_icon("save-copy"))
         self.save_copy_action.triggered.connect(self.save_drawing_copy)
         self.save_copy_action.setEnabled(False)
@@ -697,6 +890,22 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(QSize(22, 22))
         self.addToolBar(toolbar)
         toolbar.addAction(self.open_action)
+        toolbar.addSeparator()
+
+        self.path_combo = QComboBox()
+        self.path_combo.setMinimumWidth(180)
+        self._refresh_path_picker()
+        self.path_combo.currentIndexChanged.connect(self._path_selection_changed)
+        toolbar.addWidget(self.path_combo)
+        new_path_action = QAction("New path", self)
+        new_path_action.triggered.connect(self.new_swept_path)
+        toolbar.addAction(new_path_action)
+        rename_path_action = QAction("Rename", self)
+        rename_path_action.triggered.connect(self.rename_swept_path)
+        toolbar.addAction(rename_path_action)
+        remove_path_action = QAction("Remove", self)
+        remove_path_action.triggered.connect(self.remove_swept_path)
+        toolbar.addAction(remove_path_action)
         toolbar.addSeparator()
 
         self.draw_action = QAction("Draw reference path", self)
@@ -754,7 +963,7 @@ class MainWindow(QMainWindow):
                 document = read_dxf(converted_path)
             else:
                 document = read_dxf(path)
-            count, _ = draw_document(document, self.view.scene)
+            count, drawing_bounds = draw_document(document, self.view.scene)
         except Exception as error:
             if new_tempdir:
                 new_tempdir.cleanup()
@@ -767,14 +976,31 @@ class MainWindow(QMainWindow):
         self._converted_base_path = converted_path
         self.document = document
         self.drawing_path = path
+        self.view.drawing_bounds = drawing_bounds
+        margin = max(drawing_bounds.width(), drawing_bounds.height(), 1000.0) * 20
+        self.view.scene.setSceneRect(
+            drawing_bounds.adjusted(-margin, -margin, margin, margin)
+        )
         # draw_document() clears the scene, which also destroys existing overlay items.
         self.route_items.clear()
+        self.route_line_item = None
+        self.other_path_items.clear()
         self.hover_items.clear()
         self.trace_items.clear()
         self.envelope_items.clear()
         self.envelope_geometry = None
         self.simulation_result = None
-        self.route_points.clear()
+        self.swept_paths = [
+            SweptPathDocument(
+                uuid.uuid4().hex,
+                "Swept path 1",
+                str(self.vehicle_combo.currentData()),
+                "#f28583",
+                [],
+            )
+        ]
+        self.active_path_id = self.swept_paths[0].id
+        self._refresh_path_picker()
         self._hover_point = None
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
@@ -814,9 +1040,12 @@ class MainWindow(QMainWindow):
 
     def _vehicle_selected(self, _index: int = 0) -> None:
         vehicle = self._selected_vehicle()
+        if not self._path_switching:
+            self.active_path.vehicle_id = vehicle.id
         has_geometry = vehicle.id in self.vehicle_geometries
         if (
-            self._last_vehicle_geometry_mode is not None
+            not self._path_switching
+            and self._last_vehicle_geometry_mode is not None
             and self._last_vehicle_geometry_mode != has_geometry
             and self.route_points
         ):
@@ -866,12 +1095,19 @@ class MainWindow(QMainWindow):
                 "This combination needs verified tractor, trailer, axle and coupling geometry. "
                 "Edit the geometry profile to enable articulated simulation. " + vehicle.notes
             )
-        self._clear_envelope()
+        self._clear_envelope(clear_record=not self._path_switching)
         self._update_export_state()
-        self._queue_live_preview()
+        if not self._path_switching:
+            self._queue_live_preview()
 
     def _vehicle_dimensions_changed(self, _value: float = 0.0) -> None:
+        if self._path_switching:
+            return
+        for path in self.swept_paths:
+            path.simulation_result = None
+            path.envelope_geometry = None
         self._clear_envelope()
+        self._render_other_paths()
         self._update_export_state()
         self._queue_live_preview()
 
@@ -928,6 +1164,10 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.geometry is None:
             return
         self.vehicle_geometries[vehicle.id] = dialog.geometry
+        for path in self.swept_paths:
+            if path.vehicle_id == vehicle.id:
+                path.simulation_result = None
+                path.envelope_geometry = None
         settings = QSettings("OpenArch", "OpenArchSweptPaths")
         settings.setValue(
             "vehicleGeometries",
@@ -937,6 +1177,7 @@ class MainWindow(QMainWindow):
         )
         self._clear_envelope()
         self._vehicle_selected()
+        self._render_other_paths()
         self.status.showMessage(f"Saved kinematic geometry for {vehicle.name}")
 
     def save_custom_vehicle(self) -> None:
@@ -987,8 +1228,8 @@ class MainWindow(QMainWindow):
             self._preview_generation += 1
             self._hover_point = None
             self._render_hover_cursor()
-            self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self.status.showMessage("Path edit mode off · Wheel zooms · Drag pans")
+            self.view.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.status.showMessage("Path edit mode off · Drag nodes to edit · Middle-drag pans · Wheel zooms")
         self._update_export_state()
         if not enabled:
             self._queue_live_preview()
@@ -1043,7 +1284,7 @@ class MainWindow(QMainWindow):
         self._update_export_state()
         self.status.showMessage("Reference path cleared")
 
-    def _clear_envelope(self) -> None:
+    def _clear_envelope(self, *, clear_record: bool = True) -> None:
         for item in self.trace_items:
             self.view.scene.removeItem(item)
         self.trace_items.clear()
@@ -1052,20 +1293,38 @@ class MainWindow(QMainWindow):
         self.envelope_items.clear()
         self.envelope_geometry = None
         self.simulation_result = None
+        if clear_record:
+            self.active_path.simulation_result = None
+            self.active_path.envelope_geometry = None
 
     def _render_route(self) -> None:
         for item in self.route_items:
             self.view.scene.removeItem(item)
         self.route_items.clear()
+        self.route_line_item = None
         if not self.route_points:
             return
 
+        self._render_route_line()
+        for index, (x, y) in enumerate(self.route_points):
+            marker = WaypointItem(index, (x, y), self.active_path.color, self._move_waypoint)
+            self.view.scene.addItem(marker)
+            self.route_items.append(marker)
+
+    def _render_route_line(self) -> None:
+        if self.route_line_item is not None:
+            self.view.scene.removeItem(self.route_line_item)
+            if self.route_line_item in self.route_items:
+                self.route_items.remove(self.route_line_item)
+        if not self.route_points:
+            self.route_line_item = None
+            return
         path = QPainterPath()
         first_x, first_y = self.route_points[0]
         path.moveTo(first_x, -first_y)
         for x, y in self.route_points[1:]:
             path.lineTo(x, -y)
-        pen = QPen(QColor("#f28583"))
+        pen = QPen(QColor(self.active_path.color))
         pen.setCosmetic(True)
         pen.setWidthF(2.5)
         line_item = QGraphicsPathItem(path)
@@ -1073,18 +1332,75 @@ class MainWindow(QMainWindow):
         line_item.setZValue(100)
         self.view.scene.addItem(line_item)
         self.route_items.append(line_item)
+        self.route_line_item = line_item
 
-        marker_pen = QPen(Qt.GlobalColor.white)
-        marker_pen.setCosmetic(True)
-        marker_pen.setWidthF(1.5)
-        for index, (x, y) in enumerate(self.route_points):
-            marker = QGraphicsEllipseItem(x - 0.12, -y - 0.12, 0.24, 0.24)
-            marker.setBrush(QColor("#f28583"))
-            marker.setPen(marker_pen)
-            marker.setZValue(101)
-            marker.setToolTip(f"Point {index + 1}: {x:.3f}, {y:.3f}")
-            self.view.scene.addItem(marker)
-            self.route_items.append(marker)
+    def _move_waypoint(self, index: int, x: float, y: float, live: bool) -> None:
+        if not 0 <= index < len(self.route_points):
+            return
+        self.route_points[index] = (x, y)
+        self._clear_envelope()
+        if live:
+            self._render_route_line()
+        else:
+            self._render_route()
+        self._queue_live_preview()
+
+    def _render_other_paths(self) -> None:
+        for item in self.other_path_items:
+            self.view.scene.removeItem(item)
+        self.other_path_items.clear()
+        for path_document in self.swept_paths:
+            if path_document.id == self.active_path_id:
+                continue
+            if path_document.envelope_geometry is not None:
+                swept_shape = QPainterPath()
+                for polygon in polygons(path_document.envelope_geometry):
+                    self._add_ring(swept_shape, polygon.exterior.coords)
+                    for interior in polygon.interiors:
+                        self._add_ring(swept_shape, interior.coords)
+                color = QColor(path_document.color)
+                color.setAlpha(38)
+                envelope_item = QGraphicsPathItem(swept_shape)
+                envelope_item.setPen(QPen(QColor(path_document.color), 0))
+                envelope_item.setBrush(QBrush(color))
+                envelope_item.setZValue(15)
+                self.view.scene.addItem(envelope_item)
+                self.other_path_items.append(envelope_item)
+            if path_document.points:
+                path = QPainterPath()
+                path.moveTo(path_document.points[0][0], -path_document.points[0][1])
+                for x, y in path_document.points[1:]:
+                    path.lineTo(x, -y)
+                pen = QPen(QColor(path_document.color))
+                pen.setCosmetic(True)
+                pen.setWidthF(1.8)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                route_item = QGraphicsPathItem(path)
+                route_item.setPen(pen)
+                route_item.setZValue(25)
+                route_item.setToolTip(path_document.name)
+                self.view.scene.addItem(route_item)
+                self.other_path_items.append(route_item)
+                for point_index, (x, y) in enumerate(path_document.points):
+                    node = QGraphicsEllipseItem(-4, -4, 8, 8)
+                    node.setPos(x, -y)
+                    node.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+                    node.setBrush(QColor(path_document.color))
+                    node.setPen(QPen(QColor("#202326"), 1))
+                    node.setZValue(26)
+                    node.setToolTip(f"{path_document.name} · node {point_index + 1}")
+                    self.view.scene.addItem(node)
+                    self.other_path_items.append(node)
+                label = QGraphicsSimpleTextItem(
+                    self.vehicle_definitions[path_document.vehicle_id].name
+                )
+                label.setBrush(QColor(path_document.color))
+                label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+                label.setPos(path_document.points[0][0], -path_document.points[0][1])
+                label.setZValue(27)
+                label.setToolTip(path_document.name)
+                self.view.scene.addItem(label)
+                self.other_path_items.append(label)
 
     def _render_hover_cursor(self) -> None:
         for item in self.hover_items:
@@ -1216,6 +1532,9 @@ class MainWindow(QMainWindow):
         else:
             result, envelope = payload
             self.envelope_geometry = envelope
+            self.active_path.simulation_result = result
+            self.active_path.envelope_geometry = envelope
+            self.active_path.simulation_scale = self.units_spin.value()
             self._render_envelope(envelope)
             if result is None:
                 self.simulation_result = None
@@ -1262,7 +1581,7 @@ class MainWindow(QMainWindow):
     def _render_simulation_traces(
         self, result: SimulationResult, geometry: CombinationGeometry, scale: float
     ) -> None:
-        colors = ("#1a1a1a", "#627f77", "#8b7560", "#6c7f94")
+        colors = ("#e3e7eb", "#82c4b3", "#d7aa72", "#9fb6e2")
 
         def add_trace(
             points: Sequence[tuple[float, float]],
@@ -1294,9 +1613,9 @@ class MainWindow(QMainWindow):
             self.view.scene.addItem(item)
             self.trace_items.append(item)
 
-        # Show the target path in coral and the rate-limited actual path in charcoal.
+        # Show the target path in coral and the rate-limited actual path in a bright neutral.
         add_trace(result.target_steer_axle_path, "#f28583", 2.0, dashed=True)
-        add_trace(result.steer_axle_path, "#1a1a1a", 2.4)
+        add_trace(result.steer_axle_path, "#e3e7eb", 2.4)
         for unit_index, unit in enumerate(result.units):
             color = colors[unit_index % len(colors)]
             unit_geometry = geometry.units[unit_index]
@@ -1326,7 +1645,7 @@ class MainWindow(QMainWindow):
     def _render_current_vehicle(
         self, result: SimulationResult, geometry: CombinationGeometry, scale: float
     ) -> None:
-        colors = ("#24483f", "#665444", "#405a75", "#6f526e")
+        colors = ("#3d8d78", "#b17c43", "#5b7fa8", "#9a6e9b")
         final_poses: list[tuple[tuple[float, float], float]] = []
         for unit_index, (trajectory, unit_geometry) in enumerate(
             zip(result.units, geometry.units)
@@ -1437,6 +1756,97 @@ class MainWindow(QMainWindow):
             self.view.scene.addItem(coupling_item)
             self.trace_items.append(coupling_item)
 
+        self._render_vehicle_start(result, geometry, scale)
+
+    def _render_vehicle_start(
+        self, result: SimulationResult, geometry: CombinationGeometry, scale: float
+    ) -> None:
+        colors = ("#3d8d78", "#b17c43", "#5b7fa8", "#9a6e9b")
+        for unit_index, (trajectory, unit_geometry) in enumerate(
+            zip(result.units, geometry.units)
+        ):
+            reference = trajectory.reference_points[0]
+            heading = trajectory.headings_rad[0]
+            forward = (math.cos(heading), math.sin(heading))
+            normal = (-math.sin(heading), math.cos(heading))
+
+            def world(longitudinal: float, lateral: float) -> tuple[float, float]:
+                return (
+                    reference[0] + forward[0] * longitudinal + normal[0] * lateral,
+                    reference[1] + forward[1] * longitudinal + normal[1] * lateral,
+                )
+
+            corners = [
+                world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
+                world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
+                world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
+                world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
+            ]
+            shape = QPainterPath()
+            shape.moveTo(corners[0][0] * scale, -corners[0][1] * scale)
+            for x, y in corners[1:]:
+                shape.lineTo(x * scale, -y * scale)
+            shape.closeSubpath()
+            item = QGraphicsPathItem(shape)
+            color = QColor(colors[unit_index % len(colors)])
+            color.setAlpha(95)
+            item.setBrush(QBrush(color))
+            pen = QPen(QColor(colors[unit_index % len(colors)]))
+            pen.setCosmetic(True)
+            pen.setWidthF(2.0)
+            item.setPen(pen)
+            item.setZValue(61)
+            self.view.scene.addItem(item)
+            self.trace_items.append(item)
+
+            steer_angles = result.front_wheel_angles_deg[0] if unit_index == 0 else (0.0, 0.0)
+            for axle_offset in unit_geometry.axle_offsets_m:
+                is_steer = (
+                    unit_index == 0
+                    and math.isclose(axle_offset, geometry.steer_axle_m, abs_tol=1e-6)
+                )
+                for side, angle in zip((1, -1), steer_angles):
+                    wheel_heading = heading + (math.radians(angle) if is_steer else 0.0)
+                    wheel_forward = (math.cos(wheel_heading), math.sin(wheel_heading))
+                    wheel_normal = (-wheel_forward[1], wheel_forward[0])
+                    center = world(axle_offset, side * unit_geometry.track_m / 2)
+                    wheel_corners = [
+                        (
+                            center[0] + wheel_forward[0] * along + wheel_normal[0] * across,
+                            center[1] + wheel_forward[1] * along + wheel_normal[1] * across,
+                        )
+                        for along, across in ((0.48, 0.12), (0.48, -0.12), (-0.48, -0.12), (-0.48, 0.12))
+                    ]
+                    wheel_shape = QPainterPath()
+                    wheel_shape.moveTo(wheel_corners[0][0] * scale, -wheel_corners[0][1] * scale)
+                    for x, y in wheel_corners[1:]:
+                        wheel_shape.lineTo(x * scale, -y * scale)
+                    wheel_shape.closeSubpath()
+                    wheel = QGraphicsPathItem(wheel_shape)
+                    wheel.setBrush(QBrush(QColor("#181a1d")))
+                    wheel.setPen(QPen(QColor("#f7f5ef"), 0))
+                    wheel.setZValue(63)
+                    self.view.scene.addItem(wheel)
+                    self.trace_items.append(wheel)
+
+        lead = geometry.units[0]
+        start_reference = result.units[0].reference_points[0]
+        start_heading = result.units[0].headings_rad[0]
+        center_offset = (lead.front_extent_m - lead.rear_extent_m) / 2
+        label_x = (start_reference[0] + math.cos(start_heading) * center_offset) * scale
+        label_y = -(start_reference[1] + math.sin(start_heading) * center_offset) * scale
+        vehicle_name = self._selected_vehicle().name
+        label = QGraphicsSimpleTextItem(vehicle_name)
+        label.setBrush(QColor("#fff4cf"))
+        label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        label_bounds = label.boundingRect()
+        label.setPos(label_x - label_bounds.width() / 2, label_y - label_bounds.height() / 2)
+        label.setZValue(65)
+        label.setToolTip(f"{self.active_path.name} · {vehicle_name}")
+        self.view.scene.addItem(label)
+        self.trace_items.append(label)
+
     def _render_envelope(self, geometry: object) -> None:
         path = QPainterPath()
         path.setFillRule(Qt.FillRule.OddEvenFill)
@@ -1466,7 +1876,7 @@ class MainWindow(QMainWindow):
     def _update_export_state(self) -> None:
         has_path = (
             self.document is not None
-            and len(self.route_points) >= 2
+            and any(len(path.points) >= 2 for path in self.swept_paths)
             and not self.view.drawing_mode
             and not self._preview_running
             and not self.preview_timer.isActive()
@@ -1474,8 +1884,15 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(has_path)
         self.save_copy_action.setEnabled(has_path)
         vehicle = self._selected_vehicle()
-        can_calculate = has_path and (
-            vehicle.supports_preview or vehicle.id in self.vehicle_geometries
+        can_calculate = (
+            self.document is not None
+            and len(self.route_points) >= 2
+            and not self.view.drawing_mode
+            and not self._preview_running
+            and not self.preview_timer.isActive()
+            and (
+                vehicle.supports_preview or vehicle.id in self.vehicle_geometries
+            )
         )
         self.calculate_action.setEnabled(can_calculate)
 
@@ -1490,70 +1907,55 @@ class MainWindow(QMainWindow):
                 output.header["$INSUNITS"] = self.document.header.get("$INSUNITS", 0)
 
         modelspace = output.modelspace()
-        if "OASP_STEERING_PATH" not in output.layers:
-            output.layers.new(
-                "OASP_STEERING_PATH",
-                dxfattribs={"color": 1, "lineweight": 35},
-            )
-        steer_path = (
-            [
-                (x * self.simulation_scale, y * self.simulation_scale)
-                for x, y in self.simulation_result.target_steer_axle_path
-            ]
-            if self.simulation_result is not None
-            else self.route_points
-        )
-        modelspace.add_lwpolyline(
-            steer_path,
-            dxfattribs={"layer": "OASP_STEERING_PATH"},
-        )
+        for path_index, path_document in enumerate(self.swept_paths, start=1):
+            if len(path_document.points) >= 2:
+                self._write_path_dxf(modelspace, output, path_document, path_index)
+        output.saveas(target)
 
-        if self.simulation_result is not None:
-            actual_steer_layer = "OASP_ACTUAL_STEER_PATH"
-            if actual_steer_layer not in output.layers:
-                output.layers.new(actual_steer_layer, dxfattribs={"color": 7})
+    def _write_path_dxf(
+        self, modelspace: object, output: object, path_document: SweptPathDocument, index: int
+    ) -> None:
+        scale = path_document.simulation_scale
+        prefix = f"OASP_P{index}"
+        path_layer = f"{prefix}_STEER"
+        node_layer = f"{prefix}_NODES"
+        outside_layer = f"{prefix}_OUTSIDE"
+        block_layer = f"{prefix}_VEHICLE"
+        colors = (1, 4, 30, 6, 3, 5)
+        layer_color = colors[(index - 1) % len(colors)]
+
+        def ensure_layer(name: str, color: int, lineweight: int | None = None) -> None:
+            if name not in output.layers:
+                attrs: dict[str, object] = {"color": color}
+                if lineweight is not None:
+                    attrs["lineweight"] = lineweight
+                output.layers.new(name, dxfattribs=attrs)
+
+        ensure_layer(path_layer, layer_color, 35)
+        ensure_layer(node_layer, layer_color)
+        ensure_layer(outside_layer, layer_color, 25)
+        ensure_layer(block_layer, 7)
+        result = path_document.simulation_result
+        steer_points = (
+            [(x * scale, y * scale) for x, y in result.target_steer_axle_path]
+            if result is not None
+            else path_document.points
+        )
+        modelspace.add_lwpolyline(steer_points, dxfattribs={"layer": path_layer})
+        if result is not None:
+            actual_layer = f"{prefix}_ACTUAL"
+            ensure_layer(actual_layer, 7)
             modelspace.add_lwpolyline(
-                [
-                    (x * self.simulation_scale, y * self.simulation_scale)
-                    for x, y in self.simulation_result.steer_axle_path
-                ],
-                dxfattribs={"layer": actual_steer_layer},
+                [(x * scale, y * scale) for x, y in result.steer_axle_path],
+                dxfattribs={"layer": actual_layer},
             )
-            axle_colors = (4, 5, 6, 3)
-            for unit_index, unit in enumerate(self.simulation_result.units, start=1):
-                axle_layer = f"OASP_AXLE_U{unit_index}"
-                wheel_layer = f"OASP_WHEEL_U{unit_index}"
-                if axle_layer not in output.layers:
-                    output.layers.new(
-                        axle_layer,
-                        dxfattribs={"color": axle_colors[(unit_index - 1) % len(axle_colors)]},
-                    )
-                if wheel_layer not in output.layers:
-                    output.layers.new(wheel_layer, dxfattribs={"color": 94})
-                for points in unit.axle_traces.values():
-                    modelspace.add_lwpolyline(
-                        [
-                            (x * self.simulation_scale, y * self.simulation_scale)
-                            for x, y in points
-                        ],
-                        dxfattribs={"layer": axle_layer},
-                    )
-                for points in unit.wheel_traces.values():
-                    modelspace.add_lwpolyline(
-                        [
-                            (x * self.simulation_scale, y * self.simulation_scale)
-                            for x, y in points
-                        ],
-                        dxfattribs={"layer": wheel_layer},
-                    )
+        for x, y in path_document.points:
+            modelspace.add_circle(
+                (x, y), radius=max(0.15 * scale, 0.05), dxfattribs={"layer": node_layer}
+            )
 
-        if self.envelope_geometry is not None:
-            if "OASP_SWEPT_ENVELOPE_PREVIEW" not in output.layers:
-                output.layers.new(
-                    "OASP_SWEPT_ENVELOPE_PREVIEW",
-                    dxfattribs={"color": 30, "lineweight": 25},
-                )
-            for polygon in polygons(self.envelope_geometry):
+        if path_document.envelope_geometry is not None:
+            for polygon in polygons(path_document.envelope_geometry):
                 for coordinates in (
                     polygon.exterior.coords,
                     *(interior.coords for interior in polygon.interiors),
@@ -1563,15 +1965,162 @@ class MainWindow(QMainWindow):
                         modelspace.add_lwpolyline(
                             vertices,
                             close=True,
-                            dxfattribs={"layer": "OASP_SWEPT_ENVELOPE_PREVIEW"},
+                            dxfattribs={"layer": outside_layer},
                         )
-        output.saveas(target)
+
+        vehicle = self.vehicle_definitions[path_document.vehicle_id]
+        geometry = self.vehicle_geometries.get(path_document.vehicle_id)
+        if result is None or geometry is None:
+            return
+
+        block_name = f"OASP_VEHICLE_P{index}_{path_document.id[:8].upper()}"
+        vehicle_block = output.blocks.new(block_name)
+        lead_reference = result.units[0].reference_points[0]
+        lead_heading = result.units[0].headings_rad[0]
+
+        def block_point(point: tuple[float, float]) -> tuple[float, float]:
+            dx = point[0] - lead_reference[0]
+            dy = point[1] - lead_reference[1]
+            return (
+                (math.cos(lead_heading) * dx + math.sin(lead_heading) * dy) * scale,
+                (-math.sin(lead_heading) * dx + math.cos(lead_heading) * dy) * scale,
+            )
+
+        for unit_index, (trajectory, unit_geometry) in enumerate(
+            zip(result.units, geometry.units), start=1
+        ):
+            axle_layer = f"{prefix}_AXLE_U{unit_index}"
+            wheel_layer = f"{prefix}_WHEEL_U{unit_index}"
+            edge_layer = f"{prefix}_EDGE_U{unit_index}"
+            ensure_layer(axle_layer, colors[(unit_index + 1) % len(colors)])
+            ensure_layer(wheel_layer, 94)
+            ensure_layer(edge_layer, colors[(unit_index + 1) % len(colors)])
+            for points in trajectory.axle_traces.values():
+                modelspace.add_lwpolyline(
+                    [(x * scale, y * scale) for x, y in points],
+                    dxfattribs={"layer": axle_layer},
+                )
+            for points in trajectory.wheel_traces.values():
+                modelspace.add_lwpolyline(
+                    [(x * scale, y * scale) for x, y in points],
+                    dxfattribs={"layer": wheel_layer},
+                )
+            for longitudinal in (
+                unit_geometry.front_extent_m,
+                -unit_geometry.rear_extent_m,
+            ):
+                for side in (-1, 1):
+                    edge = []
+                    for (x, y), heading in zip(
+                        trajectory.reference_points, trajectory.headings_rad
+                    ):
+                        edge.append(
+                            (
+                                (x - math.sin(heading) * side * unit_geometry.width_m / 2
+                                 + math.cos(heading) * longitudinal) * scale,
+                                (y + math.cos(heading) * side * unit_geometry.width_m / 2
+                                 + math.sin(heading) * longitudinal) * scale,
+                            )
+                        )
+                    modelspace.add_lwpolyline(edge, dxfattribs={"layer": edge_layer})
+
+            # Place an oriented vehicle block at the first waypoint, including its wheels.
+            reference = trajectory.reference_points[0]
+            heading = trajectory.headings_rad[0]
+
+            def world(longitudinal: float, lateral: float) -> tuple[float, float]:
+                return (
+                    reference[0] + math.cos(heading) * longitudinal - math.sin(heading) * lateral,
+                    reference[1] + math.sin(heading) * longitudinal + math.cos(heading) * lateral,
+                )
+
+            corners = [
+                world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
+                world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
+                world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
+                world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
+            ]
+            vehicle_block.add_lwpolyline(
+                [block_point(point) for point in corners],
+                close=True,
+                dxfattribs={"layer": "0"},
+            )
+            steer_angles = result.front_wheel_angles_deg[0] if unit_index == 1 else (0.0, 0.0)
+            for axle_offset in unit_geometry.axle_offsets_m:
+                for side, angle in zip((1, -1), steer_angles):
+                    is_steer = unit_index == 1 and math.isclose(
+                        axle_offset, geometry.steer_axle_m, abs_tol=1e-6
+                    )
+                    wheel_heading = heading + (math.radians(angle) if is_steer else 0.0)
+                    center = world(axle_offset, side * unit_geometry.track_m / 2)
+                    wf = (math.cos(wheel_heading), math.sin(wheel_heading))
+                    wn = (-wf[1], wf[0])
+                    wheel_corners = [
+                        (
+                            center[0] + wf[0] * along + wn[0] * across,
+                            center[1] + wf[1] * along + wn[1] * across,
+                        )
+                        for along, across in ((0.48, 0.12), (0.48, -0.12), (-0.48, -0.12), (-0.48, 0.12))
+                    ]
+                    vehicle_block.add_lwpolyline(
+                        [block_point(point) for point in wheel_corners],
+                        close=True,
+                        dxfattribs={"layer": "0"},
+                    )
+            if unit_index == 1:
+                center = world(
+                    (unit_geometry.front_extent_m - unit_geometry.rear_extent_m) / 2,
+                    0,
+                )
+                vehicle_block.add_text(
+                    vehicle.name,
+                    dxfattribs={
+                        "height": max(1.0 * scale, 0.2),
+                        "layer": "0",
+                    },
+                ).set_placement(block_point(center))
+
+        modelspace.add_blockref(
+            block_name,
+            (lead_reference[0] * scale, lead_reference[1] * scale, 0),
+            dxfattribs={
+                "layer": block_layer,
+                "rotation": math.degrees(lead_heading),
+            },
+        )
+
+        if len(result.units) > 1:
+            coupling_layer = f"{prefix}_COUPLING"
+            ensure_layer(coupling_layer, 30)
+            for index in range(1, len(result.units)):
+                towing = result.units[index - 1]
+                trailer = result.units[index]
+                towing_geometry = geometry.units[index - 1]
+                trailer_geometry = geometry.units[index]
+                towing_ref = towing.reference_points[0]
+                towing_heading = towing.headings_rad[0]
+                trailer_ref = trailer.reference_points[0]
+                trailer_heading = trailer.headings_rad[0]
+                coupling_points = (
+                    (
+                        towing_ref[0] - math.cos(towing_heading) * towing_geometry.rear_hitch_m,
+                        towing_ref[1] - math.sin(towing_heading) * towing_geometry.rear_hitch_m,
+                    ),
+                    (
+                        trailer_ref[0] + math.cos(trailer_heading) * trailer_geometry.front_hitch_m,
+                        trailer_ref[1] + math.sin(trailer_heading) * trailer_geometry.front_hitch_m,
+                    ),
+                )
+                modelspace.add_lwpolyline(
+                    [(x * scale, y * scale) for x, y in coupling_points],
+                    dxfattribs={"layer": coupling_layer},
+                )
 
     def export_path(self) -> None:
-        if len(self.route_points) < 2:
+        if not any(len(path.points) >= 2 for path in self.swept_paths):
             return
         target, _ = QFileDialog.getSaveFileName(
-            self, "Export path and envelope", "swept_path.dxf", "DXF drawings (*.dxf)"
+            self, "Export swept paths and envelopes", "swept_paths.dxf", "DXF drawings (*.dxf)"
         )
         if not target:
             return
@@ -1582,20 +2131,19 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Could not export DXF", str(error))
             return
-        result_type = "path and envelope preview" if self.envelope_geometry else "path"
-        self.status.showMessage(f"Exported {result_type} to {target}")
+        self.status.showMessage(f"Exported {len([p for p in self.swept_paths if len(p.points) >= 2])} swept paths to {target}")
 
     def save_drawing_copy(self) -> None:
-        if len(self.route_points) < 2:
+        if not any(len(path.points) >= 2 for path in self.swept_paths):
             return
         default_name = (
-            f"{self.drawing_path.stem}_with_swept_path.dxf"
+            f"{self.drawing_path.stem}_with_swept_paths.dxf"
             if self.drawing_path
-            else "site_with_swept_path.dxf"
+            else "site_with_swept_paths.dxf"
         )
         target, _ = QFileDialog.getSaveFileName(
             self,
-            "Save drawing copy with path and envelope",
+            "Save drawing copy with swept paths",
             default_name,
             "DXF drawings (*.dxf)",
         )
@@ -1608,8 +2156,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
             QMessageBox.critical(self, "Could not save drawing copy", str(error))
             return
-        result_type = "path and envelope preview" if self.envelope_geometry else "path"
-        self.status.showMessage(f"Saved drawing copy with {result_type} to {target}")
+        self.status.showMessage(f"Saved drawing copy with swept paths to {target}")
 
     def closeEvent(self, event: object) -> None:
         if self._dwg_tempdir:
