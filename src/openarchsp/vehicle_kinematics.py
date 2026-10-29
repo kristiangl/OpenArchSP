@@ -462,6 +462,8 @@ def simulate_combination(
     spacing_m: float = 0.25,
     speed_kmh: float = 5.0,
     lock_to_lock_s: float = 6.0,
+    integration_step_s: float = 0.05,
+    envelope_pose_stride: int = 1,
     max_poses: int = 60_000,
 ) -> SimulationResult:
     """Simulate a forward combination with rate-limited steer-axle path following.
@@ -472,15 +474,17 @@ def simulate_combination(
     their front couplings with a no-lateral-slip rear axle constraint.
     """
     geometry.validate()
-    if speed_kmh <= 0 or lock_to_lock_s <= 0:
-        raise ValueError("Speed and steering lock-to-lock time must be positive.")
+    if speed_kmh <= 0 or lock_to_lock_s <= 0 or integration_step_s <= 0:
+        raise ValueError("Speed, steering lock-to-lock time and integration step must be positive.")
+    if envelope_pose_stride < 1:
+        raise ValueError("Envelope pose stride must be at least one.")
     target_samples = smooth_steer_axle_path(route, corner_radius_m, spacing_m)
     if len(target_samples) > max_poses:
         raise ValueError("This path exceeds the simulation pose limit; increase sampling spacing.")
 
     lead = geometry.units[0]
     speed = speed_kmh / 3.6
-    dt = min(0.05, spacing_m / speed)
+    dt = min(integration_step_s, spacing_m / speed)
     maximum_steer = math.radians(geometry.max_steer_deg)
     maximum_steer_rate = 2 * maximum_steer / lock_to_lock_s
     lookahead = max(2.0, 1.5 * geometry.steer_axle_m)
@@ -667,10 +671,11 @@ def simulate_combination(
             axle_traces[key] = tuple(axle_points)
             wheel_traces[f"{key} left wheel"] = tuple(left_wheels)
             wheel_traces[f"{key} right wheel"] = tuple(right_wheels)
-        for reference, heading in poses:
-            polygons.append(_rectangle(reference, heading, unit))
+        for pose_index, (reference, heading) in enumerate(poses):
+            if pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1:
+                polygons.append(_rectangle(reference, heading, unit))
             front_hitch = unit.front_hitch_m
-            if front_hitch > unit.front_extent_m:
+            if (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and front_hitch > unit.front_extent_m:
                 polygons.append(
                     _coupling_strip(
                         reference,
@@ -681,7 +686,7 @@ def simulate_combination(
                     )
                 )
             rear_hitch = -unit.rear_hitch_m
-            if rear_hitch < -unit.rear_extent_m:
+            if (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and rear_hitch < -unit.rear_extent_m:
                 polygons.append(
                     _coupling_strip(
                         reference,
@@ -691,7 +696,7 @@ def simulate_combination(
                         unit.hitch_width_m,
                     )
                 )
-            elif rear_hitch > unit.front_extent_m:
+            elif (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and rear_hitch > unit.front_extent_m:
                 polygons.append(
                     _coupling_strip(
                         reference,

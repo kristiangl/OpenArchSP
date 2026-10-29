@@ -145,6 +145,7 @@ class _PreviewWorker(QRunnable):
         route: list[tuple[float, float]],
         geometry: CombinationGeometry | None,
         *,
+        fast_preview: bool,
         scale: float,
         corner_radius_m: float,
         spacing_m: float,
@@ -157,6 +158,7 @@ class _PreviewWorker(QRunnable):
         self.token = token
         self.route = route
         self.geometry = geometry
+        self.fast_preview = fast_preview
         self.scale = scale
         self.corner_radius_m = corner_radius_m
         self.spacing_m = spacing_m
@@ -177,6 +179,8 @@ class _PreviewWorker(QRunnable):
                     spacing_m=self.spacing_m,
                     speed_kmh=self.speed_kmh,
                     lock_to_lock_s=self.lock_to_lock_s,
+                    integration_step_s=0.32 if self.fast_preview else 0.05,
+                    envelope_pose_stride=4 if self.fast_preview else 1,
                 )
                 envelope = scale_geometry(
                     result.envelope,
@@ -527,6 +531,7 @@ class MainWindow(QMainWindow):
         self._preview_generation = 0
         self._preview_running = False
         self._preview_show_errors = False
+        self._preview_fast = True
         self.preview_pool = QThreadPool(self)
         self.preview_pool.setMaxThreadCount(1)
         self.vehicle_geometries = self._load_vehicle_geometries()
@@ -551,7 +556,7 @@ class MainWindow(QMainWindow):
         self.lock_to_lock_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
-        self.preview_timer.setInterval(65)
+        self.preview_timer.setInterval(100)
         self.preview_timer.timeout.connect(self._preview_current_route)
 
         self.status = QStatusBar()
@@ -644,7 +649,7 @@ class MainWindow(QMainWindow):
         self.edit_geometry_button.clicked.connect(self.edit_vehicle_geometry)
         form.addRow(self.edit_geometry_button)
 
-        self.calculate_action = QAction("Preview swept path", self)
+        self.calculate_action = QAction("Detailed swept path", self)
         self.calculate_action.triggered.connect(lambda: self.calculate_envelope())
         self.calculate_action.setEnabled(False)
 
@@ -873,6 +878,7 @@ class MainWindow(QMainWindow):
     def _queue_live_preview(self) -> None:
         self._preview_generation += 1
         self._preview_show_errors = False
+        self._preview_fast = True
         if len(self._current_preview_route()) >= 2 and self.document is not None:
             self.preview_timer.start()
         else:
@@ -882,7 +888,9 @@ class MainWindow(QMainWindow):
     def _preview_current_route(self) -> None:
         route = self._current_preview_route()
         if len(route) >= 2 and not self._preview_running:
-            self._start_preview(route, self._preview_generation)
+            self._start_preview(
+                route, self._preview_generation, fast_preview=self._preview_fast
+            )
 
     def _current_preview_route(self) -> list[tuple[float, float]]:
         route = list(self.route_points)
@@ -1145,9 +1153,16 @@ class MainWindow(QMainWindow):
         self.preview_timer.stop()
         self._preview_generation += 1
         self._preview_show_errors = show_errors
-        self._start_preview(route, self._preview_generation)
+        self._preview_fast = False
+        self._start_preview(route, self._preview_generation, fast_preview=False)
 
-    def _start_preview(self, route: list[tuple[float, float]], token: int) -> None:
+    def _start_preview(
+        self,
+        route: list[tuple[float, float]],
+        token: int,
+        *,
+        fast_preview: bool,
+    ) -> None:
         if self._preview_running:
             return
         vehicle = self._selected_vehicle()
@@ -1168,9 +1183,10 @@ class MainWindow(QMainWindow):
             token,
             route,
             run_geometry,
+            fast_preview=fast_preview,
             scale=scale,
             corner_radius_m=self.corner_radius_spin.value(),
-            spacing_m=0.25,
+            spacing_m=2.0 if fast_preview else 0.25,
             speed_kmh=self.speed_spin.value(),
             lock_to_lock_s=self.lock_to_lock_spin.value(),
             rigid_length=self.length_spin.value(),
@@ -1230,7 +1246,7 @@ class MainWindow(QMainWindow):
                 self._preview_validity = "valid" if reachable else "invalid"
                 state = "" if reachable else " · candidate exceeds steering/path limits"
                 self.status.showMessage(
-                    f"Swept path preview · {geometry.name} · "
+                    f"{'Fast live preview' if self._preview_fast else 'Detailed preview'} · {geometry.name} · "
                     f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
                     f"axle off-tracking {max_offtracking:.2f} m · "
                     f"articulation {result.maximum_articulation_deg:.1f}° · "
@@ -1257,6 +1273,12 @@ class MainWindow(QMainWindow):
         ) -> None:
             if len(points) < 2:
                 return
+            if len(points) > 1000:
+                stride = math.ceil((len(points) - 1) / 999)
+                reduced = list(points[::stride])
+                if reduced[-1] != points[-1]:
+                    reduced.append(points[-1])
+                points = reduced
             path = QPainterPath()
             path.moveTo(points[0][0] * scale, -points[0][1] * scale)
             for x, y in points[1:]:
