@@ -8,7 +8,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import ezdxf
@@ -28,6 +28,7 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QDialog,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -85,12 +87,14 @@ def action_icon(name: str) -> QIcon:
 
 class DrawingView(QGraphicsView):
     worldClicked = Signal(float, float)
+    positionClicked = Signal(float, float)
     worldMoved = Signal(float, float)
     finishRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.drawing_mode = False
+        self.position_mode = False
         self._pan_position = None
         self.scene = QGraphicsScene(self)
         self.drawing_bounds = None
@@ -120,6 +124,11 @@ class DrawingView(QGraphicsView):
         if self.drawing_mode and event.button() == Qt.MouseButton.LeftButton:
             point = self.mapToScene(event.position().toPoint())
             self.worldClicked.emit(point.x(), -point.y())
+            event.accept()
+            return
+        if self.position_mode and event.button() == Qt.MouseButton.LeftButton:
+            point = self.mapToScene(event.position().toPoint())
+            self.positionClicked.emit(point.x(), -point.y())
             event.accept()
             return
         if self.drawing_mode and event.button() == Qt.MouseButton.RightButton:
@@ -152,6 +161,10 @@ class DrawingView(QGraphicsView):
 
     def keyPressEvent(self, event: object) -> None:
         if event.key() == Qt.Key.Key_Escape and self.drawing_mode:
+            self.finishRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.position_mode:
             self.finishRequested.emit()
             event.accept()
             return
@@ -238,6 +251,7 @@ class SweptPathDocument:
     simulation_result: SimulationResult | None = None
     envelope_geometry: object | None = None
     simulation_scale: float = 1.0
+    vehicle_stations: list[float] = field(default_factory=list)
 
 
 class WaypointItem(QGraphicsEllipseItem):
@@ -619,6 +633,7 @@ class MainWindow(QMainWindow):
         self.other_path_items: list[object] = []
         self.hover_items: list[object] = []
         self.trace_items: list[object] = []
+        self.position_items: list[object] = []
         self.envelope_items: list[object] = []
         self.envelope_geometry = None
         self.simulation_result: SimulationResult | None = None
@@ -637,10 +652,12 @@ class MainWindow(QMainWindow):
         self.view = DrawingView()
         self.setCentralWidget(self.view)
         self.view.worldClicked.connect(self.add_route_point)
+        self.view.positionClicked.connect(self.add_vehicle_station)
         self.view.worldMoved.connect(self.update_hover_point)
         self.view.finishRequested.connect(self.finish_route)
 
         self._build_vehicle_panel()
+        self._build_display_panel()
         self._build_actions()
         self.vehicle_combo.currentIndexChanged.connect(self._vehicle_selected)
         self.length_spin.valueChanged.connect(self._vehicle_dimensions_changed)
@@ -736,6 +753,7 @@ class MainWindow(QMainWindow):
             self.vehicle_combo.setCurrentIndex(vehicle_index)
         self._vehicle_selected()
         self._path_switching = False
+        self._refresh_vehicle_station_list()
         self._render_route()
         self._render_other_paths()
         if self.active_path.simulation_result and self.active_path.envelope_geometry is not None:
@@ -848,6 +866,145 @@ class MainWindow(QMainWindow):
 
         dock.setWidget(panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _build_display_panel(self) -> None:
+        settings = QSettings("OpenArch", "OpenArchSweptPaths")
+        dock = QDockWidget("Display", self)
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        self.outside_visible = QCheckBox("OASP-Outside · swept envelope", panel)
+        self.vehicle_visible = QCheckBox("OASP-Vehicle · body and axle lines", panel)
+        self.wheels_visible = QCheckBox("OASP-Wheel · wheel tracks and blocks", panel)
+        for key, checkbox in (
+            ("showOutside", self.outside_visible),
+            ("showVehicle", self.vehicle_visible),
+            ("showWheels", self.wheels_visible),
+        ):
+            checkbox.setChecked(settings.value(key, True, type=bool))
+            layout.addWidget(checkbox)
+
+        layout.addSpacing(8)
+        self.show_start_position = QCheckBox("Show start position", panel)
+        self.show_end_position = QCheckBox("Show end position", panel)
+        self.show_start_position.setChecked(settings.value("showStartPosition", True, type=bool))
+        self.show_end_position.setChecked(settings.value("showEndPosition", True, type=bool))
+        layout.addWidget(self.show_start_position)
+        layout.addWidget(self.show_end_position)
+        layout.addWidget(QLabel("Additional vehicle positions", panel))
+        self.vehicle_station_list = QListWidget(panel)
+        self.vehicle_station_list.setMaximumHeight(120)
+        layout.addWidget(self.vehicle_station_list)
+        station_buttons = QHBoxLayout()
+        self.add_station_button = QPushButton("Place on route…", panel)
+        self.remove_station_button = QPushButton("Remove", panel)
+        self.add_station_button.clicked.connect(self._begin_vehicle_station_mode)
+        self.remove_station_button.clicked.connect(self.remove_vehicle_station)
+        station_buttons.addWidget(self.add_station_button)
+        station_buttons.addWidget(self.remove_station_button)
+        layout.addLayout(station_buttons)
+        layout.addStretch(1)
+        dock.setWidget(panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+        self.outside_visible.toggled.connect(
+            lambda visible: self._set_display_option("showOutside", visible, "outside")
+        )
+        self.vehicle_visible.toggled.connect(
+            lambda visible: self._set_display_option("showVehicle", visible, "vehicle")
+        )
+        self.wheels_visible.toggled.connect(
+            lambda visible: self._set_display_option("showWheels", visible, "wheel")
+        )
+        self.show_start_position.toggled.connect(
+            lambda visible: self._set_position_option("showStartPosition", visible)
+        )
+        self.show_end_position.toggled.connect(
+            lambda visible: self._set_position_option("showEndPosition", visible)
+        )
+
+    def _set_display_option(self, key: str, visible: bool, group: str) -> None:
+        QSettings("OpenArch", "OpenArchSweptPaths").setValue(key, visible)
+        for item in self.view.scene.items():
+            if item.data(0) == group:
+                item.setVisible(visible)
+
+    def _set_position_option(self, key: str, visible: bool) -> None:
+        QSettings("OpenArch", "OpenArchSweptPaths").setValue(key, visible)
+        if self.simulation_result is not None:
+            self._render_travel_positions(
+                self.simulation_result,
+                self.vehicle_geometries[self.active_path.vehicle_id],
+                self.simulation_scale,
+            )
+
+    def _begin_vehicle_station_mode(self) -> None:
+        if self.simulation_result is None or len(self.simulation_result.steer_axle_path) < 2:
+            self.status.showMessage("Calculate a swept path before placing vehicle positions")
+            return
+        self.view.position_mode = True
+        self.view.drawing_mode = False
+        self.view.setFocus()
+        self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.status.showMessage("Click on the tracked route to place a vehicle position · Esc to stop")
+
+    def _stop_vehicle_station_mode(self) -> None:
+        self.view.position_mode = False
+        self.view.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def add_vehicle_station(self, scene_x: float, scene_y: float) -> None:
+        self._stop_vehicle_station_mode()
+        route = self.simulation_result.steer_axle_path if self.simulation_result else ()
+        if len(route) < 2:
+            return
+        scene_x /= self.simulation_scale
+        scene_y /= self.simulation_scale
+        cumulative = [0.0]
+        for first, second in zip(route, route[1:]):
+            cumulative.append(cumulative[-1] + math.dist(first, second))
+        best_distance = math.inf
+        station_distance = 0.0
+        for index, (first, second) in enumerate(zip(route, route[1:])):
+            dx, dy = second[0] - first[0], second[1] - first[1]
+            length_squared = dx * dx + dy * dy
+            fraction = min(1.0, max(0.0, ((scene_x-first[0])*dx + (scene_y-first[1])*dy) / max(length_squared, 1e-12)))
+            px, py = first[0] + dx*fraction, first[1] + dy*fraction
+            distance_squared = (px-scene_x)**2 + (py-scene_y)**2
+            if distance_squared < best_distance:
+                best_distance = distance_squared
+                station_distance = cumulative[index] + math.sqrt(length_squared) * fraction
+        total = cumulative[-1]
+        if total <= 0:
+            return
+        fraction = station_distance / total
+        if any(abs(existing - fraction) < 0.005 for existing in self.active_path.vehicle_stations):
+            self.status.showMessage("A vehicle position is already set at this route location")
+            return
+        self.active_path.vehicle_stations.append(fraction)
+        self.active_path.vehicle_stations.sort()
+        self._refresh_vehicle_station_list()
+        self._render_travel_positions(
+            self.simulation_result,
+            self.vehicle_geometries[self.active_path.vehicle_id],
+            self.simulation_scale,
+        )
+
+    def remove_vehicle_station(self) -> None:
+        row = self.vehicle_station_list.currentRow()
+        if row < 0 or row >= len(self.active_path.vehicle_stations):
+            return
+        self.active_path.vehicle_stations.pop(row)
+        self._refresh_vehicle_station_list()
+        if self.simulation_result is not None:
+            self._render_travel_positions(
+                self.simulation_result,
+                self.vehicle_geometries[self.active_path.vehicle_id],
+                self.simulation_scale,
+            )
+
+    def _refresh_vehicle_station_list(self) -> None:
+        self.vehicle_station_list.clear()
+        for fraction in self.active_path.vehicle_stations:
+            self.vehicle_station_list.addItem(f"{fraction * 100:.1f}% along route")
 
     @staticmethod
     def _dimension_spin(maximum: float, value: float) -> QDoubleSpinBox:
@@ -987,6 +1144,7 @@ class MainWindow(QMainWindow):
         self.other_path_items.clear()
         self.hover_items.clear()
         self.trace_items.clear()
+        self.position_items.clear()
         self.envelope_items.clear()
         self.envelope_geometry = None
         self.simulation_result = None
@@ -1210,6 +1368,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Saved custom vehicle: {vehicle.name}")
 
     def set_drawing_mode(self, enabled: bool) -> None:
+        if enabled:
+            self._stop_vehicle_station_mode()
         self.view.drawing_mode = enabled
         self.finish_action.setEnabled(enabled)
         if enabled:
@@ -1245,6 +1405,10 @@ class MainWindow(QMainWindow):
         self._queue_live_preview()
 
     def finish_route(self) -> None:
+        if self.view.position_mode:
+            self._stop_vehicle_station_mode()
+            self.status.showMessage("Vehicle position placement finished")
+            return
         self.preview_timer.stop()
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
@@ -1275,6 +1439,8 @@ class MainWindow(QMainWindow):
         self._hover_point = None
         self._render_hover_cursor()
         self.route_points.clear()
+        self.active_path.vehicle_stations.clear()
+        self._refresh_vehicle_station_list()
         self._clear_envelope()
         self.draw_action.setChecked(False)
         self.set_drawing_mode(False)
@@ -1288,6 +1454,7 @@ class MainWindow(QMainWindow):
         for item in self.trace_items:
             self.view.scene.removeItem(item)
         self.trace_items.clear()
+        self.position_items.clear()
         for item in self.envelope_items:
             self.view.scene.removeItem(item)
         self.envelope_items.clear()
@@ -1358,13 +1525,13 @@ class MainWindow(QMainWindow):
                     self._add_ring(swept_shape, polygon.exterior.coords)
                     for interior in polygon.interiors:
                         self._add_ring(swept_shape, interior.coords)
-                color = QColor(path_document.color)
-                color.setAlpha(38)
+                color = QColor(109, 186, 114, 42)
                 envelope_item = QGraphicsPathItem(swept_shape)
-                envelope_item.setPen(QPen(QColor(path_document.color), 0))
+                envelope_item.setPen(QPen(QColor("#6dba72"), 0))
                 envelope_item.setBrush(QBrush(color))
                 envelope_item.setZValue(15)
                 self.view.scene.addItem(envelope_item)
+                self._tag_display_item(envelope_item, "outside")
                 self.other_path_items.append(envelope_item)
             if path_document.points:
                 path = QPainterPath()
@@ -1581,7 +1748,7 @@ class MainWindow(QMainWindow):
     def _render_simulation_traces(
         self, result: SimulationResult, geometry: CombinationGeometry, scale: float
     ) -> None:
-        colors = ("#e3e7eb", "#82c4b3", "#d7aa72", "#9fb6e2")
+        colors = ("#f2f4f5", "#c9d0d5", "#aeb7be", "#e3e7eb")
 
         def add_trace(
             points: Sequence[tuple[float, float]],
@@ -1589,6 +1756,7 @@ class MainWindow(QMainWindow):
             width: float,
             *,
             dashed: bool = False,
+            group: str = "vehicle",
         ) -> None:
             if len(points) < 2:
                 return
@@ -1611,6 +1779,7 @@ class MainWindow(QMainWindow):
             item.setPen(pen)
             item.setZValue(40)
             self.view.scene.addItem(item)
+            self._tag_display_item(item, group)
             self.trace_items.append(item)
 
         # Show the target path in coral and the rate-limited actual path in a bright neutral.
@@ -1640,212 +1809,152 @@ class MainWindow(QMainWindow):
             for axle_path in unit.axle_traces.values():
                 add_trace(axle_path, color, 1.3)
             for wheel_path in unit.wheel_traces.values():
-                add_trace(wheel_path, "#84a69d", 0.8)
+                add_trace(wheel_path, "#e24a4a", 0.8, group="wheel")
+
+    def _tag_display_item(self, item: QGraphicsItem, group: str) -> None:
+        item.setData(0, group)
+        checkbox = {
+            "outside": self.outside_visible,
+            "vehicle": self.vehicle_visible,
+            "wheel": self.wheels_visible,
+        }[group]
+        item.setVisible(checkbox.isChecked())
 
     def _render_current_vehicle(
         self, result: SimulationResult, geometry: CombinationGeometry, scale: float
     ) -> None:
-        colors = ("#3d8d78", "#b17c43", "#5b7fa8", "#9a6e9b")
-        final_poses: list[tuple[tuple[float, float], float]] = []
-        for unit_index, (trajectory, unit_geometry) in enumerate(
-            zip(result.units, geometry.units)
-        ):
-            reference = trajectory.reference_points[-1]
-            heading = trajectory.headings_rad[-1]
-            final_poses.append((reference, heading))
-            forward = (math.cos(heading), math.sin(heading))
-            normal = (-math.sin(heading), math.cos(heading))
+        self._render_travel_positions(result, geometry, scale)
 
-            def world(longitudinal: float, lateral: float) -> tuple[float, float]:
-                return (
-                    reference[0] + forward[0] * longitudinal + normal[0] * lateral,
-                    reference[1] + forward[1] * longitudinal + normal[1] * lateral,
-                )
-
-            outline = QPainterPath()
-            corners = [
-                world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
-                world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
-                world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
-                world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
-            ]
-            outline.moveTo(corners[0][0] * scale, -corners[0][1] * scale)
-            for x, y in corners[1:]:
-                outline.lineTo(x * scale, -y * scale)
-            outline.closeSubpath()
-            body = QGraphicsPathItem(outline)
-            body_color = QColor(colors[unit_index % len(colors)])
-            body_color.setAlpha(62)
-            body.setBrush(QBrush(body_color))
-            pen = QPen(QColor(colors[unit_index % len(colors)]))
-            pen.setCosmetic(True)
-            pen.setWidthF(2.0)
-            body.setPen(pen)
-            body.setZValue(62)
-            body.setToolTip(unit_geometry.name)
-            self.view.scene.addItem(body)
-            self.trace_items.append(body)
-
-            steer_angles = (0.0, 0.0)
-            if unit_index == 0 and result.front_wheel_angles_deg:
-                steer_angles = result.front_wheel_angles_deg[-1]
-            for axle_offset in unit_geometry.axle_offsets_m:
-                is_steer_axle = (
-                    unit_index == 0
-                    and math.isclose(axle_offset, geometry.steer_axle_m, abs_tol=1e-6)
-                )
-                for side, steer_angle in zip((1, -1), steer_angles):
-                    wheel_heading = heading + (math.radians(steer_angle) if is_steer_axle else 0.0)
-                    wheel_forward = (math.cos(wheel_heading), math.sin(wheel_heading))
-                    wheel_center = world(axle_offset, side * unit_geometry.track_m / 2)
-                    half_length = 0.48
-                    half_width = 0.12
-                    wheel_normal = (-wheel_forward[1], wheel_forward[0])
-                    wheel_corners = [
-                        (
-                            wheel_center[0] + wheel_forward[0] * longitudinal + wheel_normal[0] * lateral,
-                            wheel_center[1] + wheel_forward[1] * longitudinal + wheel_normal[1] * lateral,
-                        )
-                        for longitudinal, lateral in (
-                            (half_length, half_width),
-                            (half_length, -half_width),
-                            (-half_length, -half_width),
-                            (-half_length, half_width),
-                        )
-                    ]
-                    wheel_path = QPainterPath()
-                    wheel_path.moveTo(wheel_corners[0][0] * scale, -wheel_corners[0][1] * scale)
-                    for x, y in wheel_corners[1:]:
-                        wheel_path.lineTo(x * scale, -y * scale)
-                    wheel_path.closeSubpath()
-                    wheel = QGraphicsPathItem(wheel_path)
-                    wheel.setBrush(QBrush(QColor("#252a28")))
-                    wheel.setPen(QPen(QColor("#f7f5ef"), 0))
-                    wheel.setZValue(64)
-                    wheel_label = f"{unit_geometry.name} wheel"
-                    if is_steer_axle:
-                        wheel_label += f" · {steer_angle:.1f}° steer"
-                    wheel.setToolTip(wheel_label)
-                    self.view.scene.addItem(wheel)
-                    self.trace_items.append(wheel)
-
-        # Draw each live coupling between the actual tractor and trailer poses.
-        for index in range(1, len(final_poses)):
-            towing_reference, towing_heading = final_poses[index - 1]
-            trailer_reference, trailer_heading = final_poses[index]
-            towing_geometry = geometry.units[index - 1]
-            trailer_geometry = geometry.units[index]
-            towing_point = (
-                towing_reference[0] - math.cos(towing_heading) * towing_geometry.rear_hitch_m,
-                towing_reference[1] - math.sin(towing_heading) * towing_geometry.rear_hitch_m,
-            )
-            trailer_point = (
-                trailer_reference[0] + math.cos(trailer_heading) * trailer_geometry.front_hitch_m,
-                trailer_reference[1] + math.sin(trailer_heading) * trailer_geometry.front_hitch_m,
-            )
-            coupling = QPainterPath()
-            coupling.moveTo(towing_point[0] * scale, -towing_point[1] * scale)
-            coupling.lineTo(trailer_point[0] * scale, -trailer_point[1] * scale)
-            pen = QPen(QColor("#d97732"))
-            pen.setCosmetic(True)
-            pen.setWidthF(2.0)
-            pen.setStyle(Qt.PenStyle.DashLine)
-            coupling_item = QGraphicsPathItem(coupling)
-            coupling_item.setPen(pen)
-            coupling_item.setZValue(63)
-            self.view.scene.addItem(coupling_item)
-            self.trace_items.append(coupling_item)
-
-        self._render_vehicle_start(result, geometry, scale)
-
-    def _render_vehicle_start(
+    def _render_travel_positions(
         self, result: SimulationResult, geometry: CombinationGeometry, scale: float
     ) -> None:
-        colors = ("#3d8d78", "#b17c43", "#5b7fa8", "#9a6e9b")
-        for unit_index, (trajectory, unit_geometry) in enumerate(
-            zip(result.units, geometry.units)
-        ):
-            reference = trajectory.reference_points[0]
-            heading = trajectory.headings_rad[0]
-            forward = (math.cos(heading), math.sin(heading))
-            normal = (-math.sin(heading), math.cos(heading))
+        for item in self.position_items:
+            self.view.scene.removeItem(item)
+            if item in self.trace_items:
+                self.trace_items.remove(item)
+        self.position_items.clear()
+        if not result.units or not result.steer_axle_path:
+            return
 
-            def world(longitudinal: float, lateral: float) -> tuple[float, float]:
-                return (
-                    reference[0] + forward[0] * longitudinal + normal[0] * lateral,
-                    reference[1] + forward[1] * longitudinal + normal[1] * lateral,
-                )
+        last_index = len(result.steer_axle_path) - 1
+        positions: list[tuple[int, str]] = []
+        if self.show_start_position.isChecked():
+            positions.append((0, "Start"))
+        if self.show_end_position.isChecked():
+            positions.append((last_index, "End"))
+        for station_index, fraction in enumerate(self.active_path.vehicle_stations, start=1):
+            positions.append((round(fraction * last_index), f"Position {station_index}"))
 
-            corners = [
-                world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
-                world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
-                world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
-                world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
-            ]
-            shape = QPainterPath()
-            shape.moveTo(corners[0][0] * scale, -corners[0][1] * scale)
-            for x, y in corners[1:]:
-                shape.lineTo(x * scale, -y * scale)
-            shape.closeSubpath()
-            item = QGraphicsPathItem(shape)
-            color = QColor(colors[unit_index % len(colors)])
-            color.setAlpha(95)
-            item.setBrush(QBrush(color))
-            pen = QPen(QColor(colors[unit_index % len(colors)]))
-            pen.setCosmetic(True)
-            pen.setWidthF(2.0)
-            item.setPen(pen)
-            item.setZValue(61)
-            self.view.scene.addItem(item)
-            self.trace_items.append(item)
+        colors = ("#f2f4f5", "#c9d0d5", "#aeb7be", "#e3e7eb")
+        vehicle_name = self.vehicle_definitions[self.active_path.vehicle_id].name
+        for pose_index, position_name in positions:
+            poses: list[tuple[tuple[float, float], float]] = []
+            for unit_index, (trajectory, unit_geometry) in enumerate(zip(result.units, geometry.units)):
+                reference = trajectory.reference_points[pose_index]
+                heading = trajectory.headings_rad[pose_index]
+                poses.append((reference, heading))
+                forward = (math.cos(heading), math.sin(heading))
+                normal = (-math.sin(heading), math.cos(heading))
 
-            steer_angles = result.front_wheel_angles_deg[0] if unit_index == 0 else (0.0, 0.0)
-            for axle_offset in unit_geometry.axle_offsets_m:
-                is_steer = (
-                    unit_index == 0
-                    and math.isclose(axle_offset, geometry.steer_axle_m, abs_tol=1e-6)
-                )
-                for side, angle in zip((1, -1), steer_angles):
-                    wheel_heading = heading + (math.radians(angle) if is_steer else 0.0)
-                    wheel_forward = (math.cos(wheel_heading), math.sin(wheel_heading))
-                    wheel_normal = (-wheel_forward[1], wheel_forward[0])
-                    center = world(axle_offset, side * unit_geometry.track_m / 2)
-                    wheel_corners = [
-                        (
-                            center[0] + wheel_forward[0] * along + wheel_normal[0] * across,
-                            center[1] + wheel_forward[1] * along + wheel_normal[1] * across,
-                        )
-                        for along, across in ((0.48, 0.12), (0.48, -0.12), (-0.48, -0.12), (-0.48, 0.12))
-                    ]
-                    wheel_shape = QPainterPath()
-                    wheel_shape.moveTo(wheel_corners[0][0] * scale, -wheel_corners[0][1] * scale)
-                    for x, y in wheel_corners[1:]:
-                        wheel_shape.lineTo(x * scale, -y * scale)
-                    wheel_shape.closeSubpath()
-                    wheel = QGraphicsPathItem(wheel_shape)
-                    wheel.setBrush(QBrush(QColor("#181a1d")))
-                    wheel.setPen(QPen(QColor("#f7f5ef"), 0))
-                    wheel.setZValue(63)
-                    self.view.scene.addItem(wheel)
-                    self.trace_items.append(wheel)
+                def world(longitudinal: float, lateral: float) -> tuple[float, float]:
+                    return (reference[0] + forward[0] * longitudinal + normal[0] * lateral,
+                            reference[1] + forward[1] * longitudinal + normal[1] * lateral)
 
-        lead = geometry.units[0]
-        start_reference = result.units[0].reference_points[0]
-        start_heading = result.units[0].headings_rad[0]
-        center_offset = (lead.front_extent_m - lead.rear_extent_m) / 2
-        label_x = (start_reference[0] + math.cos(start_heading) * center_offset) * scale
-        label_y = -(start_reference[1] + math.sin(start_heading) * center_offset) * scale
-        vehicle_name = self._selected_vehicle().name
-        label = QGraphicsSimpleTextItem(vehicle_name)
-        label.setBrush(QColor("#fff4cf"))
-        label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
-        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-        label_bounds = label.boundingRect()
-        label.setPos(label_x - label_bounds.width() / 2, label_y - label_bounds.height() / 2)
-        label.setZValue(65)
-        label.setToolTip(f"{self.active_path.name} · {vehicle_name}")
-        self.view.scene.addItem(label)
-        self.trace_items.append(label)
+                corners = [
+                    world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
+                    world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
+                    world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
+                    world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
+                ]
+                shape = QPainterPath()
+                shape.moveTo(corners[0][0] * scale, -corners[0][1] * scale)
+                for x, y in corners[1:]:
+                    shape.lineTo(x * scale, -y * scale)
+                shape.closeSubpath()
+                body = QGraphicsPathItem(shape)
+                body.setBrush(QBrush(QColor(20, 22, 24, 165)))
+                pen = QPen(QColor(colors[unit_index % len(colors)]))
+                pen.setCosmetic(True)
+                pen.setWidthF(2.0)
+                body.setPen(pen)
+                body.setZValue(62)
+                body.setToolTip(f"{position_name} · {unit_geometry.name}")
+                self.view.scene.addItem(body)
+                self._tag_display_item(body, "vehicle")
+                self.trace_items.append(body)
+                self.position_items.append(body)
+
+                steer_angles = result.front_wheel_angles_deg[pose_index] if unit_index == 0 else (0.0, 0.0)
+                for axle_offset in unit_geometry.axle_offsets_m:
+                    is_steer = unit_index == 0 and math.isclose(
+                        axle_offset, geometry.steer_axle_m, abs_tol=1e-6
+                    )
+                    for side, angle in zip((1, -1), steer_angles):
+                        wheel_heading = heading + (math.radians(angle) if is_steer else 0.0)
+                        wf = (math.cos(wheel_heading), math.sin(wheel_heading))
+                        wn = (-wf[1], wf[0])
+                        center = world(axle_offset, side * unit_geometry.track_m / 2)
+                        wheel_corners = [
+                            (center[0] + wf[0] * along + wn[0] * across,
+                             center[1] + wf[1] * along + wn[1] * across)
+                            for along, across in ((0.48, 0.12), (0.48, -0.12), (-0.48, -0.12), (-0.48, 0.12))
+                        ]
+                        wheel_shape = QPainterPath()
+                        wheel_shape.moveTo(wheel_corners[0][0] * scale, -wheel_corners[0][1] * scale)
+                        for x, y in wheel_corners[1:]:
+                            wheel_shape.lineTo(x * scale, -y * scale)
+                        wheel_shape.closeSubpath()
+                        wheel = QGraphicsPathItem(wheel_shape)
+                        wheel.setBrush(QBrush(QColor("#17191b")))
+                        wheel.setPen(QPen(QColor("#e24a4a"), 0))
+                        wheel.setZValue(64)
+                        wheel.setToolTip(f"{unit_geometry.name} wheel" + (f" · {angle:.1f}° steer" if is_steer else ""))
+                        self.view.scene.addItem(wheel)
+                        self._tag_display_item(wheel, "wheel")
+                        self.trace_items.append(wheel)
+                        self.position_items.append(wheel)
+
+            for index in range(1, len(poses)):
+                towing_reference, towing_heading = poses[index - 1]
+                trailer_reference, trailer_heading = poses[index]
+                towing = geometry.units[index - 1]
+                trailer = geometry.units[index]
+                p1 = (towing_reference[0] - math.cos(towing_heading) * towing.rear_hitch_m,
+                      towing_reference[1] - math.sin(towing_heading) * towing.rear_hitch_m)
+                p2 = (trailer_reference[0] + math.cos(trailer_heading) * trailer.front_hitch_m,
+                      trailer_reference[1] + math.sin(trailer_heading) * trailer.front_hitch_m)
+                coupling = QPainterPath()
+                coupling.moveTo(p1[0] * scale, -p1[1] * scale)
+                coupling.lineTo(p2[0] * scale, -p2[1] * scale)
+                pen = QPen(QColor("#f2f4f5"))
+                pen.setCosmetic(True)
+                pen.setWidthF(1.5)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                item = QGraphicsPathItem(coupling)
+                item.setPen(pen)
+                item.setZValue(63)
+                self.view.scene.addItem(item)
+                self._tag_display_item(item, "vehicle")
+                self.trace_items.append(item)
+                self.position_items.append(item)
+
+            lead, (start_reference, start_heading) = geometry.units[0], poses[0]
+            center_offset = (lead.front_extent_m - lead.rear_extent_m) / 2
+            label_x = (start_reference[0] + math.cos(start_heading) * center_offset) * scale
+            label_y = -(start_reference[1] + math.sin(start_heading) * center_offset) * scale
+            label_text = f"{position_name} · {vehicle_name}" if position_name == "Start" else position_name
+            label = QGraphicsSimpleTextItem(label_text)
+            label.setBrush(QColor("#f2f4f5"))
+            label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+            label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+            bounds = label.boundingRect()
+            label.setPos(label_x - bounds.width() / 2, label_y - bounds.height() / 2)
+            label.setZValue(65)
+            label.setToolTip(f"{self.active_path.name} · {label_text}")
+            self.view.scene.addItem(label)
+            self._tag_display_item(label, "vehicle")
+            self.trace_items.append(label)
+            self.position_items.append(label)
 
     def _render_envelope(self, geometry: object) -> None:
         path = QPainterPath()
@@ -1856,10 +1965,11 @@ class MainWindow(QMainWindow):
                 self._add_ring(path, interior.coords)
 
         envelope = QGraphicsPathItem(path)
-        envelope.setPen(QPen(QColor("#84a69d"), 0))
-        envelope.setBrush(QBrush(QColor(132, 166, 157, 92)))
+        envelope.setPen(QPen(QColor("#6dba72"), 0))
+        envelope.setBrush(QBrush(QColor(109, 186, 114, 76)))
         envelope.setZValue(50)
         self.view.scene.addItem(envelope)
+        self._tag_display_item(envelope, "outside")
         self.envelope_items.append(envelope)
 
     @staticmethod
@@ -1917,24 +2027,35 @@ class MainWindow(QMainWindow):
     ) -> None:
         scale = path_document.simulation_scale
         prefix = f"OASP_P{index}"
-        path_layer = f"{prefix}_STEER"
+        path_layer = f"OASP-Vehicle-P{index}-Steer"
         node_layer = f"{prefix}_NODES"
-        outside_layer = f"{prefix}_OUTSIDE"
-        block_layer = f"{prefix}_VEHICLE"
+        outside_layer = f"OASP-Outside-P{index}"
         colors = (1, 4, 30, 6, 3, 5)
         layer_color = colors[(index - 1) % len(colors)]
 
-        def ensure_layer(name: str, color: int, lineweight: int | None = None) -> None:
+        def ensure_layer(
+            name: str,
+            color: int,
+            lineweight: int | None = None,
+            visibility_group: str | None = None,
+        ) -> None:
             if name not in output.layers:
                 attrs: dict[str, object] = {"color": color}
                 if lineweight is not None:
                     attrs["lineweight"] = lineweight
                 output.layers.new(name, dxfattribs=attrs)
+            if visibility_group is not None:
+                checkbox = {
+                    "outside": self.outside_visible,
+                    "vehicle": self.vehicle_visible,
+                    "wheel": self.wheels_visible,
+                }[visibility_group]
+                layer = output.layers.get(name)
+                layer.on() if checkbox.isChecked() else layer.off()
 
-        ensure_layer(path_layer, layer_color, 35)
+        ensure_layer(path_layer, 7, 35, "vehicle")
         ensure_layer(node_layer, layer_color)
-        ensure_layer(outside_layer, layer_color, 25)
-        ensure_layer(block_layer, 7)
+        ensure_layer(outside_layer, 3, 25, "outside")
         result = path_document.simulation_result
         steer_points = (
             [(x * scale, y * scale) for x, y in result.target_steer_axle_path]
@@ -1943,8 +2064,8 @@ class MainWindow(QMainWindow):
         )
         modelspace.add_lwpolyline(steer_points, dxfattribs={"layer": path_layer})
         if result is not None:
-            actual_layer = f"{prefix}_ACTUAL"
-            ensure_layer(actual_layer, 7)
+            actual_layer = f"OASP-Vehicle-P{index}-Actual-Steer"
+            ensure_layer(actual_layer, 7, visibility_group="vehicle")
             modelspace.add_lwpolyline(
                 [(x * scale, y * scale) for x, y in result.steer_axle_path],
                 dxfattribs={"layer": actual_layer},
@@ -1973,28 +2094,17 @@ class MainWindow(QMainWindow):
         if result is None or geometry is None:
             return
 
-        block_name = f"OASP_VEHICLE_P{index}_{path_document.id[:8].upper()}"
-        vehicle_block = output.blocks.new(block_name)
-        lead_reference = result.units[0].reference_points[0]
-        lead_heading = result.units[0].headings_rad[0]
-
-        def block_point(point: tuple[float, float]) -> tuple[float, float]:
-            dx = point[0] - lead_reference[0]
-            dy = point[1] - lead_reference[1]
-            return (
-                (math.cos(lead_heading) * dx + math.sin(lead_heading) * dy) * scale,
-                (-math.sin(lead_heading) * dx + math.cos(lead_heading) * dy) * scale,
-            )
-
+        unit_layers: list[tuple[str, str]] = []
         for unit_index, (trajectory, unit_geometry) in enumerate(
             zip(result.units, geometry.units), start=1
         ):
-            axle_layer = f"{prefix}_AXLE_U{unit_index}"
-            wheel_layer = f"{prefix}_WHEEL_U{unit_index}"
-            edge_layer = f"{prefix}_EDGE_U{unit_index}"
-            ensure_layer(axle_layer, colors[(unit_index + 1) % len(colors)])
-            ensure_layer(wheel_layer, 94)
-            ensure_layer(edge_layer, colors[(unit_index + 1) % len(colors)])
+            axle_layer = f"OASP-Vehicle-P{index}-Axle-U{unit_index}"
+            wheel_layer = f"OASP-Wheel-P{index}-U{unit_index}"
+            edge_layer = f"OASP-Vehicle-P{index}-Body-U{unit_index}"
+            ensure_layer(axle_layer, 7, visibility_group="vehicle")
+            ensure_layer(wheel_layer, 1, visibility_group="wheel")
+            ensure_layer(edge_layer, 7, visibility_group="vehicle")
+            unit_layers.append((wheel_layer, edge_layer))
             for points in trajectory.axle_traces.values():
                 modelspace.add_lwpolyline(
                     [(x * scale, y * scale) for x, y in points],
@@ -2024,97 +2134,140 @@ class MainWindow(QMainWindow):
                         )
                     modelspace.add_lwpolyline(edge, dxfattribs={"layer": edge_layer})
 
-            # Place an oriented vehicle block at the first waypoint, including its wheels.
-            reference = trajectory.reference_points[0]
-            heading = trajectory.headings_rad[0]
+        pose_count = len(result.steer_axle_path)
+        last_pose = pose_count - 1
+        positions: list[tuple[int, str]] = []
+        if self.show_start_position.isChecked():
+            positions.append((0, "Start"))
+        if self.show_end_position.isChecked():
+            positions.append((last_pose, "End"))
+        for station_index, fraction in enumerate(path_document.vehicle_stations, start=1):
+            positions.append((round(fraction * last_pose), f"Position {station_index}"))
+        unique_positions: list[tuple[int, str]] = []
+        seen_pose_indices: set[int] = set()
+        for pose_index, label in positions:
+            if pose_index not in seen_pose_indices:
+                unique_positions.append((pose_index, label))
+                seen_pose_indices.add(pose_index)
 
-            def world(longitudinal: float, lateral: float) -> tuple[float, float]:
-                return (
-                    reference[0] + math.cos(heading) * longitudinal - math.sin(heading) * lateral,
-                    reference[1] + math.sin(heading) * longitudinal + math.cos(heading) * lateral,
-                )
-
-            corners = [
-                world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
-                world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
-                world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
-                world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
-            ]
-            vehicle_block.add_lwpolyline(
-                [block_point(point) for point in corners],
-                close=True,
-                dxfattribs={"layer": "0"},
-            )
-            steer_angles = result.front_wheel_angles_deg[0] if unit_index == 1 else (0.0, 0.0)
-            for axle_offset in unit_geometry.axle_offsets_m:
-                for side, angle in zip((1, -1), steer_angles):
-                    is_steer = unit_index == 1 and math.isclose(
-                        axle_offset, geometry.steer_axle_m, abs_tol=1e-6
-                    )
-                    wheel_heading = heading + (math.radians(angle) if is_steer else 0.0)
-                    center = world(axle_offset, side * unit_geometry.track_m / 2)
-                    wf = (math.cos(wheel_heading), math.sin(wheel_heading))
-                    wn = (-wf[1], wf[0])
-                    wheel_corners = [
-                        (
-                            center[0] + wf[0] * along + wn[0] * across,
-                            center[1] + wf[1] * along + wn[1] * across,
-                        )
-                        for along, across in ((0.48, 0.12), (0.48, -0.12), (-0.48, -0.12), (-0.48, 0.12))
-                    ]
-                    vehicle_block.add_lwpolyline(
-                        [block_point(point) for point in wheel_corners],
-                        close=True,
-                        dxfattribs={"layer": "0"},
-                    )
-            if unit_index == 1:
-                center = world(
-                    (unit_geometry.front_extent_m - unit_geometry.rear_extent_m) / 2,
-                    0,
-                )
-                vehicle_block.add_text(
-                    vehicle.name,
-                    dxfattribs={
-                        "height": max(1.0 * scale, 0.2),
-                        "layer": "0",
-                    },
-                ).set_placement(block_point(center))
-
-        modelspace.add_blockref(
-            block_name,
-            (lead_reference[0] * scale, lead_reference[1] * scale, 0),
-            dxfattribs={
-                "layer": block_layer,
-                "rotation": math.degrees(lead_heading),
-            },
-        )
-
+        coupling_layer = f"OASP-Vehicle-P{index}-Coupling"
         if len(result.units) > 1:
-            coupling_layer = f"{prefix}_COUPLING"
-            ensure_layer(coupling_layer, 30)
-            for index in range(1, len(result.units)):
-                towing = result.units[index - 1]
-                trailer = result.units[index]
-                towing_geometry = geometry.units[index - 1]
-                trailer_geometry = geometry.units[index]
-                towing_ref = towing.reference_points[0]
-                towing_heading = towing.headings_rad[0]
-                trailer_ref = trailer.reference_points[0]
-                trailer_heading = trailer.headings_rad[0]
+            ensure_layer(coupling_layer, 7, visibility_group="vehicle")
+        for position_number, (pose_index, label) in enumerate(unique_positions, start=1):
+            block_name = f"OASP_VEHICLE_P{index}_{position_number}_{path_document.id[:8].upper()}"
+            vehicle_block = output.blocks.new(block_name)
+            lead_reference = result.units[0].reference_points[pose_index]
+            lead_heading = result.units[0].headings_rad[pose_index]
+
+            def block_point(point: tuple[float, float]) -> tuple[float, float]:
+                dx = point[0] - lead_reference[0]
+                dy = point[1] - lead_reference[1]
+                return (
+                    (math.cos(lead_heading) * dx + math.sin(lead_heading) * dy) * scale,
+                    (-math.sin(lead_heading) * dx + math.cos(lead_heading) * dy) * scale,
+                )
+
+            poses: list[tuple[tuple[float, float], float]] = []
+            for unit_index, (trajectory, unit_geometry) in enumerate(
+                zip(result.units, geometry.units)
+            ):
+                reference = trajectory.reference_points[pose_index]
+                heading = trajectory.headings_rad[pose_index]
+                poses.append((reference, heading))
+                forward = (math.cos(heading), math.sin(heading))
+                normal = (-math.sin(heading), math.cos(heading))
+
+                def world(longitudinal: float, lateral: float) -> tuple[float, float]:
+                    return (
+                        reference[0] + forward[0] * longitudinal + normal[0] * lateral,
+                        reference[1] + forward[1] * longitudinal + normal[1] * lateral,
+                    )
+
+                body_layer = unit_layers[unit_index][1]
+                wheel_layer = unit_layers[unit_index][0]
+                corners = [
+                    world(unit_geometry.front_extent_m, unit_geometry.width_m / 2),
+                    world(unit_geometry.front_extent_m, -unit_geometry.width_m / 2),
+                    world(-unit_geometry.rear_extent_m, -unit_geometry.width_m / 2),
+                    world(-unit_geometry.rear_extent_m, unit_geometry.width_m / 2),
+                ]
+                vehicle_block.add_lwpolyline(
+                    [block_point(point) for point in corners],
+                    close=True,
+                    dxfattribs={"layer": body_layer},
+                )
+                steer_angles = (
+                    result.front_wheel_angles_deg[pose_index]
+                    if unit_index == 0 and result.front_wheel_angles_deg
+                    else (0.0, 0.0)
+                )
+                for axle_offset in unit_geometry.axle_offsets_m:
+                    for side, angle in zip((1, -1), steer_angles):
+                        is_steer = unit_index == 0 and math.isclose(
+                            axle_offset, geometry.steer_axle_m, abs_tol=1e-6
+                        )
+                        wheel_heading = heading + (math.radians(angle) if is_steer else 0.0)
+                        wf = (math.cos(wheel_heading), math.sin(wheel_heading))
+                        wn = (-wf[1], wf[0])
+                        center = world(axle_offset, side * unit_geometry.track_m / 2)
+                        wheel_corners = [
+                            (
+                                center[0] + wf[0] * along + wn[0] * across,
+                                center[1] + wf[1] * along + wn[1] * across,
+                            )
+                            for along, across in (
+                                (0.48, 0.12),
+                                (0.48, -0.12),
+                                (-0.48, -0.12),
+                                (-0.48, 0.12),
+                            )
+                        ]
+                        vehicle_block.add_lwpolyline(
+                            [block_point(point) for point in wheel_corners],
+                            close=True,
+                            dxfattribs={"layer": wheel_layer},
+                        )
+                if unit_index == 0:
+                    center = world(
+                        (unit_geometry.front_extent_m - unit_geometry.rear_extent_m) / 2,
+                        0,
+                    )
+                    text = vehicle.name if label == "Start" else label
+                    vehicle_block.add_text(
+                        text,
+                        dxfattribs={"height": max(1.0 * scale, 0.2), "layer": body_layer},
+                    ).set_placement(block_point(center))
+
+            for unit_index in range(1, len(poses)):
+                towing_reference, towing_heading = poses[unit_index - 1]
+                trailer_reference, trailer_heading = poses[unit_index]
+                towing_geometry = geometry.units[unit_index - 1]
+                trailer_geometry = geometry.units[unit_index]
                 coupling_points = (
                     (
-                        towing_ref[0] - math.cos(towing_heading) * towing_geometry.rear_hitch_m,
-                        towing_ref[1] - math.sin(towing_heading) * towing_geometry.rear_hitch_m,
+                        towing_reference[0] - math.cos(towing_heading) * towing_geometry.rear_hitch_m,
+                        towing_reference[1] - math.sin(towing_heading) * towing_geometry.rear_hitch_m,
                     ),
                     (
-                        trailer_ref[0] + math.cos(trailer_heading) * trailer_geometry.front_hitch_m,
-                        trailer_ref[1] + math.sin(trailer_heading) * trailer_geometry.front_hitch_m,
+                        trailer_reference[0] + math.cos(trailer_heading) * trailer_geometry.front_hitch_m,
+                        trailer_reference[1] + math.sin(trailer_heading) * trailer_geometry.front_hitch_m,
                     ),
                 )
-                modelspace.add_lwpolyline(
-                    [(x * scale, y * scale) for x, y in coupling_points],
+                vehicle_block.add_lwpolyline(
+                    [block_point(point) for point in coupling_points],
                     dxfattribs={"layer": coupling_layer},
                 )
+
+            modelspace.add_blockref(
+                block_name,
+                (lead_reference[0] * scale, lead_reference[1] * scale, 0),
+                dxfattribs={
+                    # Keep the insert on layer 0 so its vehicle and wheel geometry
+                    # can be toggled independently through their own block layers.
+                    "layer": "0",
+                    "rotation": math.degrees(lead_heading),
+                },
+            )
 
     def export_path(self) -> None:
         if not any(len(path.points) >= 2 for path in self.swept_paths):

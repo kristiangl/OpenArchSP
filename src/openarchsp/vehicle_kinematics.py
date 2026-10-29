@@ -376,31 +376,67 @@ def _wrap_angle(angle: float) -> float:
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
+ProjectionSegment = tuple[float, float, float, float, float, float, float]
+
+
+def _prepare_path_projection(
+    samples: Sequence[RouteSample],
+) -> tuple[ProjectionSegment, ...]:
+    """Cache invariant segment values used by the many path projections in a simulation."""
+    segments: list[ProjectionSegment] = []
+    for start, end in zip(samples, samples[1:]):
+        dx = end.point[0] - start.point[0]
+        dy = end.point[1] - start.point[1]
+        length_squared = dx * dx + dy * dy
+        inverse_length_squared = 1.0 / length_squared if length_squared > 0 else 0.0
+        segments.append(
+            (
+                start.point[0],
+                start.point[1],
+                dx,
+                dy,
+                inverse_length_squared,
+                start.distance_m,
+                end.distance_m - start.distance_m,
+            )
+        )
+    return tuple(segments)
+
+
 def _project_onto_path(
-    point: Point, samples: Sequence[RouteSample], start_segment: int
+    point: Point,
+    samples: Sequence[RouteSample],
+    start_segment: int,
+    projection_segments: Sequence[ProjectionSegment],
 ) -> tuple[Point, float, int, float]:
     """Project onto a forward window of path segments for monotonic driver tracking."""
     first = max(0, start_segment - 2)
     last = min(len(samples) - 1, start_segment + 64)
     best_point = samples[first].point
-    best_distance = math.inf
+    best_distance_squared = math.inf
     best_progress = samples[first].distance_m
     best_segment = first
     for index in range(first, last):
-        start, end = samples[index].point, samples[index + 1].point
-        delta = _sub(end, start)
-        length_squared = _dot(delta, delta)
-        fraction = min(1.0, max(0.0, _dot(_sub(point, start), delta) / length_squared))
-        candidate = _add(start, _scale(delta, fraction))
-        distance = math.dist(candidate, point)
-        if distance < best_distance:
-            best_point = candidate
-            best_distance = distance
-            best_progress = samples[index].distance_m + fraction * (
-                samples[index + 1].distance_m - samples[index].distance_m
-            )
+        start_x, start_y, dx, dy, inverse_length_squared, distance_start, distance_delta = (
+            projection_segments[index]
+        )
+        offset_x = point[0] - start_x
+        offset_y = point[1] - start_y
+        fraction = min(
+            1.0,
+            max(0.0, (offset_x * dx + offset_y * dy) * inverse_length_squared),
+        )
+        candidate_x = start_x + dx * fraction
+        candidate_y = start_y + dy * fraction
+        error_x = candidate_x - point[0]
+        error_y = candidate_y - point[1]
+        distance_squared = error_x * error_x + error_y * error_y
+        if distance_squared < best_distance_squared:
+            best_distance_squared = distance_squared
+            best_point = (candidate_x, candidate_y)
+            best_progress = distance_start + fraction * distance_delta
             best_segment = index
-    return best_point, best_progress, best_segment, best_distance
+    return best_point, best_progress, best_segment, math.sqrt(best_distance_squared)
 
 
 def _point_at_distance(
@@ -481,6 +517,7 @@ def simulate_combination(
     target_samples = smooth_steer_axle_path(route, corner_radius_m, spacing_m)
     if len(target_samples) > max_poses:
         raise ValueError("This path exceeds the simulation pose limit; increase sampling spacing.")
+    projection_segments = _prepare_path_projection(target_samples)
 
     lead = geometry.units[0]
     speed = speed_kmh / 3.6
@@ -509,7 +546,7 @@ def simulate_combination(
     for _step in range(maximum_steps):
         front = _add(rear_axle, _scale(_unit(heading), geometry.steer_axle_m))
         _projected, projected_s, path_segment, path_error = _project_onto_path(
-            front, target_samples, path_segment
+            front, target_samples, path_segment, projection_segments
         )
         progress = max(progress, projected_s)
         maximum_path_error = max(maximum_path_error, path_error)
@@ -555,6 +592,7 @@ def simulate_combination(
             steer_points, lead_poses, steering, actual_distances
         )
     )
+    actual_projection_segments = _prepare_path_projection(samples)
     if len(samples) > max_poses:
         raise ValueError("This path exceeds the simulation pose limit; increase sampling spacing.")
 
@@ -657,7 +695,7 @@ def simulate_combination(
                 left_wheels.append(_add(axle_center, _scale(normal, unit.track_m / 2)))
                 right_wheels.append(_sub(axle_center, _scale(normal, unit.track_m / 2)))
                 projection, _progress, path_segment, _error = _project_onto_path(
-                    axle_center, samples, path_segment
+                    axle_center, samples, path_segment, actual_projection_segments
                 )
                 path_start = samples[path_segment].point
                 path_end = samples[path_segment + 1].point
