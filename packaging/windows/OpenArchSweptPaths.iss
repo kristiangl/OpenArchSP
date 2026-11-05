@@ -1,6 +1,6 @@
 #define AppName "OpenArch Swept Paths"
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 
 [Setup]
@@ -21,12 +21,19 @@ WizardStyle=modern
 SetupIconFile=..\icons\openarchsp.ico
 UninstallDisplayIcon={app}\OpenArchSweptPaths.exe
 PrivilegesRequired=admin
+ChangesAssociations=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "..\..\dist\OpenArchSweptPaths\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Registry]
+Root: HKA; Subkey: "Software\Classes\.oasp\OpenWithProgids"; ValueType: string; ValueName: "OpenArchSP.Project"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\OpenArchSP.Project"; ValueType: string; ValueData: "OpenArch swept path project"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\OpenArchSP.Project\DefaultIcon"; ValueType: string; ValueData: "{app}\OpenArchSweptPaths.exe,0"
+Root: HKA; Subkey: "Software\Classes\OpenArchSP.Project\shell\open\command"; ValueType: string; ValueData: """{app}\OpenArchSweptPaths.exe"" ""%1"""
 
 [Icons]
 Name: "{autoprograms}\OpenArch Swept Paths"; Filename: "{app}\OpenArchSweptPaths.exe"

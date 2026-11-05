@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/assets/openarchsp-logo.svg" alt="OpenArchSP" width="640"></p>
 
-OpenArch Swept Paths is a standalone desktop application built with Python, PySide6 (Qt), ezdxf and Shapely, with a small Rust helper for DWG conversion. The app imports DWG and DXF drawings and exports DXF. GitHub Actions packages it on native Windows, macOS and Linux runners.
+OpenArch Swept Paths is a standalone desktop application built with Python, PySide6 (Qt), ezdxf and Shapely, with a small Rust helper for DWG conversion. The app imports DWG and DXF drawings and saves editable .oasp projects or DXF exports. GitHub Actions packages it on native Windows, macOS and Linux runners.
 
 ## Downloads
 
@@ -18,9 +18,10 @@ Actions artifacts are retained for 14 days. A matching version tag publishes per
 
 1. Open a DWG or DXF site drawing as a base layer. DWG files are converted to a temporary DXF for processing; the original DWG is never modified.
 2. Work in the dark CAD-style canvas. Middle-drag pans across an extended workspace beyond the drawing extents; the wheel zooms and View → Zoom to Extents reframes the imported drawing.
-3. Choose a design vehicle. AP-G34-based editable axle and coupling profiles load automatically where available. Review **Source / model** and use **Edit axle and coupling geometry** to inspect or change the profile; the displayed length and width then come from that geometry.
+3. Choose a design vehicle. AP-G34-based editable axle and coupling profiles load automatically where available. Review **Source / model** and use **Edit geometry** to inspect or change the profile; the displayed length and width then come from that geometry.
 4. Create named paths from the toolbar selector. Move the cursor to preview the next waypoint before clicking. The fast, lower-resolution candidate steer-axle path, swept envelope, body-edge traces, axle and wheel paths, and articulated vehicle pose update as the cursor moves. The candidate marker turns red when the model exceeds steering, path-following or articulation limits. Clicking commits a node; drag nodes after finishing to edit them. Right-click or press Enter to finish; Backspace removes the last node. Finishing runs the detailed preview in the background. Adjust turn radius, maximum road-wheel angle and steering lock-to-lock time to see the preview respond.
-5. For configured vehicle geometry, the steering model follows the steer-axle path. Vehicles without geometry retain the rigid preview. The **Detailed swept path** action recalculates on demand. The Display panel controls the OASP-Outside, OASP-Vehicle and OASP-Wheel groups. Start and end articulated vehicle poses are shown by default; use **Place on route…** to add more full vehicle poses and **Remove** to delete a selected one. DXF export includes those selected poses as articulated vehicle blocks with steered wheels, and exports the layer visibility choices using green Outside, white Vehicle and red Wheel layers.
+5. Use **Save project** (Ctrl+S on Windows) to keep the drawing, editable waypoints, vehicle profiles, path settings and positions together in an .oasp file. Use **Open** to resume editing. **Paths DXF** exports the swept paths, and **Drawing DXF** includes the background.
+6. For configured vehicle geometry, the steering model follows the steer-axle path. Vehicles without geometry retain the rigid preview. The **Detailed swept path** action recalculates on demand. The Display panel controls the OASP-Outside, OASP-Vehicle and OASP-Wheel groups. Start and end articulated vehicle poses are shown by default; use **Place on route…** to add more full vehicle poses and **Remove** to delete a selected one. DXF export includes those selected poses as articulated vehicle blocks with steered wheels, and exports the layer visibility choices using green Outside, white Vehicle and red Wheel layers.
 
 The source drawing is never overwritten. Saving a copy of a DWG-based project creates a DXF copy containing the converted base drawing and overlays. DXF units are read when available; unitless files default to metres and expose a drawing-units-per-metre control. DWG conversion uses bundled acadrust (MPL-2.0); see THIRD_PARTY_NOTICES.md. Conversion may not preserve every proprietary/custom object, and the viewer only displays its supported model-space entity types.
 

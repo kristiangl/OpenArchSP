@@ -38,6 +38,25 @@ class StandardVehicleGeometryTests(unittest.TestCase):
                     )
                 )
 
+    def test_turn_envelope_bridges_outer_front_corners_without_filling_inside_turn(self):
+        from shapely.geometry import Point
+
+        geometry = self.profiles["passenger-vehicle-5-2"]
+        result = simulate_combination([(0, 0), (40, 0), (40, 40)], geometry,
+                                      corner_radius_m=12, spacing_m=0.5, envelope_pose_stride=8)
+        trajectory = result.units[0]
+        body = geometry.units[0]
+        poses = list(zip(trajectory.reference_points, trajectory.headings_rad))
+        corners = []
+        for (x, y), heading in poses[::8]:
+            c, s = math.cos(heading), math.sin(heading)
+            corners.append((x + body.front_extent_m*c + body.width_m*s/2,
+                            y + body.front_extent_m*s - body.width_m*c/2))
+        for a, b in zip(corners, corners[1:]):
+            midpoint = Point((a[0] + b[0])/2, (a[1] + b[1])/2)
+            self.assertLess(result.envelope.distance(midpoint), 1e-8)
+        self.assertFalse(result.envelope.covers(Point(20, 20)))
+
     def test_b_triple_tracks_left_and_right_15m_turns(self):
         geometry = self.profiles["b-triple-35-4"]
         for route in (

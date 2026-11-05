@@ -16,6 +16,8 @@ from shapely.geometry import Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
+from openarchsp.swept_path import swept_spans
+
 
 Point = tuple[float, float]
 
@@ -709,41 +711,21 @@ def simulate_combination(
             axle_traces[key] = tuple(axle_points)
             wheel_traces[f"{key} left wheel"] = tuple(left_wheels)
             wheel_traces[f"{key} right wheel"] = tuple(right_wheels)
-        for pose_index, (reference, heading) in enumerate(poses):
-            if pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1:
-                polygons.append(_rectangle(reference, heading, unit))
-            front_hitch = unit.front_hitch_m
-            if (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and front_hitch > unit.front_extent_m:
-                polygons.append(
-                    _coupling_strip(
-                        reference,
-                        heading,
-                        unit.front_extent_m,
-                        front_hitch,
-                        unit.hitch_width_m,
-                    )
-                )
-            rear_hitch = -unit.rear_hitch_m
-            if (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and rear_hitch < -unit.rear_extent_m:
-                polygons.append(
-                    _coupling_strip(
-                        reference,
-                        heading,
-                        rear_hitch,
-                        -unit.rear_extent_m,
-                        unit.hitch_width_m,
-                    )
-                )
-            elif (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and rear_hitch > unit.front_extent_m:
-                polygons.append(
-                    _coupling_strip(
-                        reference,
-                        heading,
-                        unit.front_extent_m,
-                        rear_hitch,
-                        unit.hitch_width_m,
-                    )
-                )
+        envelope_poses = poses[::envelope_pose_stride]
+        if (len(poses) - 1) % envelope_pose_stride:
+            envelope_poses.append(poses[-1])
+        polygons.extend(swept_spans(
+            _rectangle(reference, heading, unit) for reference, heading in envelope_poses
+        ))
+        # Sweep protruding couplings separately so gaps between bodies stay open.
+        for hitch in (unit.front_hitch_m, -unit.rear_hitch_m):
+            body_edge = min(unit.front_extent_m, max(-unit.rear_extent_m, hitch))
+            if hitch != body_edge:
+                polygons.extend(swept_spans(
+                    _coupling_strip(reference, heading, min(hitch, body_edge),
+                                    max(hitch, body_edge), unit.hitch_width_m)
+                    for reference, heading in envelope_poses
+                ))
         trajectories.append(
             UnitTrajectory(
                 unit.name,

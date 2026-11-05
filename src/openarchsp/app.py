@@ -8,11 +8,12 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import fields, replace
+from html import escape
+from urllib.parse import urlsplit
 from pathlib import Path
 
 import ezdxf
-from shapely.affinity import scale as scale_geometry
 from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QAction,
@@ -24,6 +25,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QFont,
     QPen,
+    QUndoStack,
 )
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -48,9 +50,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
-    QPushButton,
     QStatusBar,
+    QProgressBar,
+    QStackedWidget,
+    QToolButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -59,15 +65,18 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
 )
 
-from openarchsp.drawing import convert_dwg_to_dxf, draw_document, read_dxf
-from openarchsp.swept_path import polygons, swept_footprint
+from openarchsp.start_screen import StartScreen
+from openarchsp.history import EditCommand, EditorState, PathState, undoable
+from openarchsp.drawing import make_scene, prepare_background, read_dxf
+from openarchsp.project import PathSettings, Project, SweptPathDocument, calculate_path, save_project
+from openarchsp.swept_path import polygons
 from openarchsp.standard_profiles import standard_vehicle_geometries
 from openarchsp.vehicles import (
     CUSTOM_RIGID_VEHICLE,
     STANDARD_VEHICLES,
     VehicleDefinition,
 )
-from openarchsp.vehicle_kinematics import CombinationGeometry, SimulationResult, simulate_combination
+from openarchsp.vehicle_kinematics import CombinationGeometry, SimulationResult
 
 
 def asset_path(name: str) -> Path:
@@ -83,6 +92,15 @@ def action_icon(name: str) -> QIcon:
     if not QSvgRenderer(str(icon_file)).isValid():
         return QIcon()
     return QIcon(str(icon_file))
+
+
+def command_button(label, icon, parent=None):
+    button = QToolButton(parent)
+    button.setText(label)
+    button.setIcon(action_icon(icon))
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+    button.setAccessibleName(label)
+    return button
 
 
 class DrawingView(QGraphicsView):
@@ -137,6 +155,14 @@ class DrawingView(QGraphicsView):
             return
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event: object) -> None:
+        if self.drawing_mode and event.button() == Qt.MouseButton.LeftButton:
+            # Qt already sent the first press, which committed the final waypoint.
+            self.finishRequested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event: object) -> None:
         if self.drawing_mode and self._pan_position is None:
             point = self.mapToScene(event.position().toPoint())
@@ -178,80 +204,73 @@ class _PreviewSignals(QObject):
 class _PreviewWorker(QRunnable):
     """Calculate one drawing preview without blocking mouse interaction."""
 
-    def __init__(
-        self,
-        token: int,
-        route: list[tuple[float, float]],
-        geometry: CombinationGeometry | None,
-        *,
-        fast_preview: bool,
-        scale: float,
-        corner_radius_m: float,
-        spacing_m: float,
-        speed_kmh: float,
-        lock_to_lock_s: float,
-        rigid_length: float,
-        rigid_width: float,
-    ) -> None:
+    def __init__(self, token, route, geometry, settings, units, fast):
         super().__init__()
         self.token = token
-        self.route = route
-        self.geometry = geometry
-        self.fast_preview = fast_preview
-        self.scale = scale
-        self.corner_radius_m = corner_radius_m
-        self.spacing_m = spacing_m
-        self.speed_kmh = speed_kmh
-        self.lock_to_lock_s = lock_to_lock_s
-        self.rigid_length = rigid_length
-        self.rigid_width = rigid_width
+        self.arguments = route, geometry, settings, units, fast
         self.signals = _PreviewSignals()
 
     def run(self) -> None:
         try:
-            if self.geometry is not None:
-                route_metres = [(x / self.scale, y / self.scale) for x, y in self.route]
-                result = simulate_combination(
-                    route_metres,
-                    self.geometry,
-                    corner_radius_m=self.corner_radius_m,
-                    spacing_m=self.spacing_m,
-                    speed_kmh=self.speed_kmh,
-                    lock_to_lock_s=self.lock_to_lock_s,
-                    integration_step_s=0.32 if self.fast_preview else 0.05,
-                    envelope_pose_stride=4 if self.fast_preview else 1,
-                )
-                envelope = scale_geometry(
-                    result.envelope,
-                    xfact=self.scale,
-                    yfact=self.scale,
-                    origin=(0, 0),
-                )
-                payload = (result, envelope)
-            else:
-                envelope = swept_footprint(
-                    self.route,
-                    self.rigid_length * self.scale,
-                    self.rigid_width * self.scale,
-                    max(0.25 * self.scale, 1e-6),
-                )
-                payload = (None, envelope)
+            payload = calculate_path(*self.arguments)
             self.signals.finished.emit(self.token, payload, "")
         except Exception as error:
             self.signals.finished.emit(self.token, None, str(error))
 
 
-@dataclass
-class SweptPathDocument:
-    id: str
-    name: str
-    vehicle_id: str
-    color: str
-    points: list[tuple[float, float]]
-    simulation_result: SimulationResult | None = None
-    envelope_geometry: object | None = None
-    simulation_scale: float = 1.0
-    vehicle_stations: list[float] = field(default_factory=list)
+class _LoadSignals(QObject):
+    progress = Signal(str, int)
+    finished = Signal(object, str)
+
+
+class _LoadWorker(QRunnable):
+    def __init__(self, source: Path, directory: Path):
+        super().__init__()
+        self.source = source
+        self.directory = directory
+        self.signals = _LoadSignals()
+
+    def run(self):
+        try:
+            payload = prepare_background(self.source, self.directory, self.signals.progress.emit)
+            self.signals.finished.emit(payload, "")
+        except Exception as error:
+            self.signals.finished.emit(None, str(error))
+
+
+class LoadingDialog(QDialog):
+    def __init__(self, parent, source):
+        super().__init__(parent)
+        self.setWindowTitle("Open drawing or project")
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        title = QLabel(source.name)
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(title)
+        self.stage = QLabel("Opening file…")
+        layout.addWidget(self.stage)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)
+        layout.addWidget(self.bar)
+        self.payload = None
+        self.error = ""
+
+    def update_stage(self, label, percent):
+        self.stage.setText(label)
+        self.bar.setRange(0, 0 if percent < 0 else 100)
+        if percent >= 0:
+            self.bar.setValue(percent)
+
+    def finish(self, payload, error):
+        self.payload = payload
+        self.error = error
+        self.accept()
+
+    def reject(self):
+        # The converter cannot be interrupted safely halfway through an import.
+        pass
 
 
 class WaypointItem(QGraphicsEllipseItem):
@@ -389,17 +408,17 @@ class GeometryDialog(QDialog):
                     self._append_unit(unit)
 
         unit_actions = QHBoxLayout()
-        for label, callback in (
-            ("Add tractor", self._add_tractor),
-            ("Add trailer", self._add_trailer),
-            ("Add converter dolly", self._add_dolly),
-            ("Add axle station", self._add_axle),
-            ("Remove axle station", self._remove_axle),
-            ("Remove component", self._remove_unit),
-            ("Move up", lambda: self._move_unit(-1)),
-            ("Move down", lambda: self._move_unit(1)),
+        for label, icon, callback in (
+            ("Add tractor", "add", self._add_tractor),
+            ("Add trailer", "add", self._add_trailer),
+            ("Add converter dolly", "add", self._add_dolly),
+            ("Add axle station", "add", self._add_axle),
+            ("Remove axle station", "remove", self._remove_axle),
+            ("Remove component", "remove", self._remove_unit),
+            ("Move up", "up", lambda: self._move_unit(-1)),
+            ("Move down", "down", lambda: self._move_unit(1)),
         ):
-            button = QPushButton(label)
+            button = command_button(label, icon)
             button.clicked.connect(callback)
             unit_actions.addWidget(button)
         unit_actions.addStretch(1)
@@ -607,14 +626,31 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background: #48515a; }"
             "QHeaderView::section { background: #30363c; color: #d8dde3; padding: 5px; "
             "border: 1px solid #454b52; }"
-            "QStatusBar { background: #24272b; color: #b9c0c7; }"
+            "QStatusBar { background: #20282c; color: #bbcbcf; border-top: 1px solid #38454b; }"
+            "QToolBar::separator { background: #475359; width: 1px; margin: 7px 4px; }"
+            "QToolButton:disabled, QPushButton:disabled { color: #838c92; }"
+            "QToolButton:focus, QPushButton:focus, QComboBox:focus, QDoubleSpinBox:focus {"
+            "border: 1px solid #8fcbb7; }"
+            "QTabBar::tab { padding: 8px 14px; background: #272e32; color: #bbc4ca; }"
+            "QTabBar::tab:selected { color: #e9f2ee; border-top: 2px solid #89beae; }"
+            "QListWidget { background: #1b2023; border: 1px solid #455158; }"
+            "QProgressBar { background: #181e20; border: 1px solid #46545a; text-align: center; }"
+            "QProgressBar::chunk { background: #47796c; }"
+            "QScrollArea { border: 0; }"
             "QScrollBar:vertical, QScrollBar:horizontal { background: #1b1d20; width: 12px; height: 12px; }"
             "QScrollBar::handle { background: #4b535b; border-radius: 5px; min-height: 22px; }"
         )
+        self.undo_stack = QUndoStack(self)
+        self.undo_stack.setUndoLimit(100)
+        self._history_depth = 0
+        self._history_restoring = False
+        self._history_current = None
+        self.project_path: Path | None = None
+        self._saved_state = None
         self.document = None
         self.drawing_path: Path | None = None
-        self._dwg_tempdir: tempfile.TemporaryDirectory[str] | None = None
-        self._converted_base_path: Path | None = None
+        self._background_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._background_file: Path | None = None
         self.vehicle_definitions = self._load_vehicle_definitions()
         first_vehicle_id = next(iter(self.vehicle_definitions))
         self.swept_paths = [
@@ -650,7 +686,14 @@ class MainWindow(QMainWindow):
         self._last_vehicle_geometry_mode: bool | None = None
 
         self.view = DrawingView()
-        self.setCentralWidget(self.view)
+        self.start_screen = StartScreen(asset_path(""))
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.start_screen)
+        self.pages.addWidget(self.view)
+        self.setCentralWidget(self.pages)
+        self.start_screen.openRequested.connect(self.open_dxf)
+        self.start_screen.returnRequested.connect(self._show_editor)
+        self._editor_dock_state = (True, True)
         self.view.worldClicked.connect(self.add_route_point)
         self.view.positionClicked.connect(self.add_vehicle_station)
         self.view.worldMoved.connect(self.update_hover_point)
@@ -662,7 +705,7 @@ class MainWindow(QMainWindow):
         self.vehicle_combo.currentIndexChanged.connect(self._vehicle_selected)
         self.length_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.width_spin.valueChanged.connect(self._vehicle_dimensions_changed)
-        self.units_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.units_spin.valueChanged.connect(self._drawing_scale_changed)
         self.corner_radius_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.speed_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.steering_limit_spin.valueChanged.connect(self._vehicle_dimensions_changed)
@@ -676,6 +719,38 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Open a DXF or DWG site drawing to begin")
         self.setStatusBar(self.status)
         self._vehicle_selected()
+        self._show_start_screen()
+
+    def _show_start_screen(self):
+        if self.pages.currentWidget() == self.view:
+            self._editor_dock_state = tuple(
+                not dock.isHidden() for dock in (self.vehicle_dock, self.display_dock)
+            )
+            if self.view.drawing_mode or self.view.position_mode:
+                self.finish_route()
+        self.pages.setCurrentWidget(self.start_screen)
+        self.start_screen.return_button.setVisible(self.document is not None)
+        for dock in (self.vehicle_dock, self.display_dock):
+            dock.hide()
+            dock.toggleViewAction().setEnabled(False)
+        for toolbar in self.editor_toolbars:
+            toolbar.hide()
+        self.edit_menu.setEnabled(False)
+        self.status.hide()
+        self.start_screen.open_button.setFocus()
+
+    def _show_editor(self):
+        if self.document is None:
+            return
+        self.pages.setCurrentWidget(self.view)
+        for dock, visible in zip((self.vehicle_dock, self.display_dock), self._editor_dock_state):
+            dock.setVisible(visible)
+            dock.toggleViewAction().setEnabled(True)
+        for toolbar in self.editor_toolbars:
+            toolbar.show()
+        self.edit_menu.setEnabled(True)
+        self.status.show()
+        self.view.setFocus()
 
     @property
     def active_path(self) -> SweptPathDocument:
@@ -695,6 +770,7 @@ class MainWindow(QMainWindow):
             self.path_combo.setCurrentIndex(index)
         self.path_combo.blockSignals(False)
 
+    @undoable("New path")
     def new_swept_path(self) -> None:
         number = len(self.swept_paths) + 1
         colors = ("#f28583", "#70b7d3", "#d0a45b", "#a590cf", "#7fbd91", "#da7da8")
@@ -705,10 +781,12 @@ class MainWindow(QMainWindow):
             colors[(number - 1) % len(colors)],
             [],
         )
+        path.settings = self._settings()
         self.swept_paths.append(path)
         self._refresh_path_picker()
         self.path_combo.setCurrentIndex(self.path_combo.findData(path.id))
 
+    @undoable("Rename path")
     def rename_swept_path(self) -> None:
         path = self.active_path
         name, accepted = QInputDialog.getText(
@@ -720,6 +798,7 @@ class MainWindow(QMainWindow):
         self._refresh_path_picker()
         self._render_other_paths()
 
+    @undoable("Remove path")
     def remove_swept_path(self) -> None:
         if len(self.swept_paths) == 1:
             self.clear_route()
@@ -734,9 +813,16 @@ class MainWindow(QMainWindow):
         path_id = str(self.path_combo.itemData(index))
         if not path_id or path_id == self.active_path_id:
             return
+        for previous in self.swept_paths:
+            if previous.id == self.active_path_id:
+                previous.settings = self._settings()
+                if not previous.detailed:
+                    previous.simulation_result = None
+                    previous.envelope_geometry = None
         self.preview_timer.stop()
         self._preview_generation += 1
         self._hover_point = None
+        self._stop_vehicle_station_mode()
         self.view.drawing_mode = False
         self.finish_action.setEnabled(False)
         self.draw_action.setChecked(False)
@@ -752,6 +838,7 @@ class MainWindow(QMainWindow):
         if vehicle_index >= 0:
             self.vehicle_combo.setCurrentIndex(vehicle_index)
         self._vehicle_selected()
+        self._apply_settings(self.active_path.settings)
         self._path_switching = False
         self._refresh_vehicle_station_list()
         self._render_route()
@@ -771,9 +858,14 @@ class MainWindow(QMainWindow):
                 self.vehicle_geometries[self.active_path.vehicle_id],
                 self.simulation_scale,
             )
+        elif self.active_path.envelope_geometry is not None:
+            self.envelope_geometry = self.active_path.envelope_geometry
+            self._render_envelope(self.envelope_geometry)
         elif len(self.route_points) >= 2 and self.document is not None:
-            self._queue_live_preview()
+            self.calculate_envelope(show_errors=False)
         self._update_export_state()
+        if not self._history_depth and not self._history_restoring:
+            self._history_current = self._capture_history()
 
     def _load_vehicle_definitions(self) -> dict[str, VehicleDefinition]:
         definitions = {vehicle.id: vehicle for vehicle in STANDARD_VEHICLES}
@@ -804,8 +896,19 @@ class MainWindow(QMainWindow):
         dock = QDockWidget("Vehicle and units", self)
         panel = QWidget()
         form = QFormLayout(panel)
+        form.setContentsMargins(14, 16, 14, 16)
+        form.setVerticalSpacing(9)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
+        def section_title(text):
+            label = QLabel(text)
+            label.setStyleSheet("color: #9ac4b6; font-weight: 600; padding-top: 5px;")
+            form.addRow(label)
+
+        section_title("Vehicle profile")
         self.vehicle_combo = QComboBox()
+        self.vehicle_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.vehicle_combo.setMinimumContentsLength(16)
         for vehicle in self.vehicle_definitions.values():
             self.vehicle_combo.addItem(vehicle.name, vehicle.id)
         form.addRow("Design vehicle", self.vehicle_combo)
@@ -813,6 +916,7 @@ class MainWindow(QMainWindow):
         self.length_spin = self._dimension_spin(100.0, 5.2)
         self.width_spin = self._dimension_spin(20.0, 1.9)
         self.units_spin = QDoubleSpinBox()
+        self.units_spin.setKeyboardTracking(False)
         self.units_spin.setRange(0.000001, 1_000_000_000)
         self.units_spin.setDecimals(6)
         self.units_spin.setSingleStep(1)
@@ -823,7 +927,7 @@ class MainWindow(QMainWindow):
 
         form.addRow("Length (m)", self.length_spin)
         form.addRow("Width (m)", self.width_spin)
-        form.addRow("Drawing units per metre", self.units_spin)
+        section_title("Path settings")
         self.corner_radius_spin = self._dimension_spin(100.0, 12.5)
         self.corner_radius_spin.setToolTip(
             "Radius used to round path waypoints into tangential turns."
@@ -836,35 +940,55 @@ class MainWindow(QMainWindow):
             "Maximum centre road-wheel angle used by the live steering simulation. "
             "This overrides the vehicle profile for the current run."
         )
-        form.addRow("Maximum road-wheel angle (°)", self.steering_limit_spin)
+        form.addRow("Road-wheel limit (°)", self.steering_limit_spin)
         self.lock_to_lock_spin = self._dimension_spin(30.0, 6.0)
         self.lock_to_lock_spin.setToolTip(
             "Time for the road wheels to move from full lock one way to full lock the other."
         )
         form.addRow("Steering lock-to-lock (s)", self.lock_to_lock_spin)
 
+        form.addRow("Drawing units per metre", self.units_spin)
+        section_title("Profile details")
         self.vehicle_source_label = QLabel()
         self.vehicle_source_label.setWordWrap(True)
         form.addRow("Source / model", self.vehicle_source_label)
 
         self.vehicle_note_label = QLabel()
         self.vehicle_note_label.setWordWrap(True)
-        self.vehicle_note_label.setStyleSheet("color: #c1ad83;")
+        self.vehicle_note_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.vehicle_note_label.setStyleSheet("color: #d0c4aa;")
+        notes_button = QToolButton()
+        notes_button.setCheckable(True)
+        notes_button.setText("Dimensions and assumptions")
+        notes_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        notes_button.setArrowType(Qt.ArrowType.RightArrow)
+        notes_button.toggled.connect(self.vehicle_note_label.setVisible)
+        notes_button.toggled.connect(lambda opened: notes_button.setArrowType(
+            Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow))
+        form.addRow(notes_button)
         form.addRow(self.vehicle_note_label)
+        self.vehicle_note_label.hide()
 
-        self.save_vehicle_button = QPushButton("Save dimensions as custom vehicle…")
+        self.save_vehicle_button = command_button("Save custom vehicle", "project")
         self.save_vehicle_button.clicked.connect(self.save_custom_vehicle)
-        form.addRow(self.save_vehicle_button)
+        vehicle_buttons = QHBoxLayout()
+        vehicle_buttons.addWidget(self.save_vehicle_button)
 
-        self.edit_geometry_button = QPushButton("Edit axle and coupling geometry…")
+        self.edit_geometry_button = command_button("Edit geometry", "geometry")
         self.edit_geometry_button.clicked.connect(self.edit_vehicle_geometry)
-        form.addRow(self.edit_geometry_button)
+        vehicle_buttons.addWidget(self.edit_geometry_button)
+        form.addRow(vehicle_buttons)
 
         self.calculate_action = QAction("Detailed swept path", self)
         self.calculate_action.triggered.connect(lambda: self.calculate_envelope())
         self.calculate_action.setEnabled(False)
 
-        dock.setWidget(panel)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(320)
+        scroll.setWidget(panel)
+        dock.setWidget(scroll)
+        self.vehicle_dock = dock
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     def _build_display_panel(self) -> None:
@@ -892,11 +1016,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.show_end_position)
         layout.addWidget(QLabel("Additional vehicle positions", panel))
         self.vehicle_station_list = QListWidget(panel)
-        self.vehicle_station_list.setMaximumHeight(120)
+        self.vehicle_station_list.setMaximumHeight(160)
         layout.addWidget(self.vehicle_station_list)
         station_buttons = QHBoxLayout()
-        self.add_station_button = QPushButton("Place on route…", panel)
-        self.remove_station_button = QPushButton("Remove", panel)
+        self.add_station_button = command_button("Place on route", "add", panel)
+        self.remove_station_button = command_button("Remove", "remove", panel)
         self.add_station_button.clicked.connect(self._begin_vehicle_station_mode)
         self.remove_station_button.clicked.connect(self.remove_vehicle_station)
         station_buttons.addWidget(self.add_station_button)
@@ -906,6 +1030,10 @@ class MainWindow(QMainWindow):
         dock.setWidget(panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
+        self.tabifyDockWidget(self.vehicle_dock, dock)
+        self.vehicle_dock.raise_()
+        self.display_dock = dock
+        self.resizeDocks([self.vehicle_dock], [360], Qt.Orientation.Horizontal)
         self.outside_visible.toggled.connect(
             lambda visible: self._set_display_option("showOutside", visible, "outside")
         )
@@ -922,12 +1050,14 @@ class MainWindow(QMainWindow):
             lambda visible: self._set_position_option("showEndPosition", visible)
         )
 
+    @undoable("Change display")
     def _set_display_option(self, key: str, visible: bool, group: str) -> None:
         QSettings("OpenArch", "OpenArchSweptPaths").setValue(key, visible)
         for item in self.view.scene.items():
             if item.data(0) == group:
                 item.setVisible(visible)
 
+    @undoable("Change vehicle display")
     def _set_position_option(self, key: str, visible: bool) -> None:
         QSettings("OpenArch", "OpenArchSweptPaths").setValue(key, visible)
         if self.simulation_result is not None:
@@ -951,6 +1081,7 @@ class MainWindow(QMainWindow):
         self.view.position_mode = False
         self.view.setCursor(Qt.CursorShape.ArrowCursor)
 
+    @undoable("Place vehicle")
     def add_vehicle_station(self, scene_x: float, scene_y: float) -> None:
         self._stop_vehicle_station_mode()
         route = self.simulation_result.steer_axle_path if self.simulation_result else ()
@@ -988,6 +1119,7 @@ class MainWindow(QMainWindow):
             self.simulation_scale,
         )
 
+    @undoable("Remove vehicle position")
     def remove_vehicle_station(self) -> None:
         row = self.vehicle_station_list.currentRow()
         if row < 0 or row >= len(self.active_path.vehicle_stations):
@@ -1009,6 +1141,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _dimension_spin(maximum: float, value: float) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
+        spin.setKeyboardTracking(False)
         spin.setRange(0.1, maximum)
         spin.setDecimals(3)
         spin.setSingleStep(0.1)
@@ -1017,11 +1150,20 @@ class MainWindow(QMainWindow):
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
-        self.open_action = QAction("&Open drawing…", self)
+        self.open_action = QAction("&Open drawing or project…", self)
         self.open_action.setIcon(action_icon("open"))
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
         self.open_action.triggered.connect(self.open_dxf)
         file_menu.addAction(self.open_action)
+
+        self.project_action = QAction(action_icon("project"), "Save project", self)
+        self.project_action.setShortcut(QKeySequence.StandardKey.Save)
+        self.project_action.triggered.connect(self.save_editable_project)
+        file_menu.addAction(self.project_action)
+        self.project_as_action = file_menu.addAction("Save project as…")
+        self.project_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
+        self.project_as_action.triggered.connect(lambda: self.save_editable_project(save_as=True))
+        file_menu.addSeparator()
 
         self.export_action = QAction("Export swept paths as DXF…", self)
         self.export_action.setIcon(action_icon("export"))
@@ -1041,26 +1183,35 @@ class MainWindow(QMainWindow):
         fit_action.setShortcut("Z")
         fit_action.triggered.connect(self.view.fit_drawing)
         view_menu.addAction(fit_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.vehicle_dock.toggleViewAction())
+        view_menu.addAction(self.display_dock.toggleViewAction())
 
         toolbar = QToolBar("Path")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(22, 22))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         self.addToolBar(toolbar)
+        self.editor_toolbars = [toolbar]
+        self.open_action.setIconText("Open")
         toolbar.addAction(self.open_action)
+        toolbar.addAction(self.project_action)
         toolbar.addSeparator()
 
         self.path_combo = QComboBox()
-        self.path_combo.setMinimumWidth(180)
+        self.path_combo.setMinimumContentsLength(12)
+        self.path_combo.setAccessibleName("Active swept path")
+        self.path_combo.setToolTip("Active swept path")
         self._refresh_path_picker()
         self.path_combo.currentIndexChanged.connect(self._path_selection_changed)
         toolbar.addWidget(self.path_combo)
-        new_path_action = QAction("New path", self)
+        new_path_action = QAction(action_icon("add"), "New path", self)
         new_path_action.triggered.connect(self.new_swept_path)
         toolbar.addAction(new_path_action)
-        rename_path_action = QAction("Rename", self)
+        rename_path_action = QAction(action_icon("rename"), "Rename", self)
         rename_path_action.triggered.connect(self.rename_swept_path)
         toolbar.addAction(rename_path_action)
-        remove_path_action = QAction("Remove", self)
+        remove_path_action = QAction(action_icon("remove"), "Remove", self)
         remove_path_action.triggered.connect(self.remove_swept_path)
         toolbar.addAction(remove_path_action)
         toolbar.addSeparator()
@@ -1079,66 +1230,109 @@ class MainWindow(QMainWindow):
         self.finish_action.triggered.connect(self.finish_route)
         toolbar.addAction(self.finish_action)
 
-        undo_action = QAction("Undo point", self)
-        undo_action.setIcon(action_icon("undo"))
-        undo_action.setShortcut(QKeySequence("Backspace"))
-        undo_action.triggered.connect(self.undo_route_point)
-        toolbar.addAction(undo_action)
+        edit_menu = QMenu("&Edit", self)
+        self.edit_menu = edit_menu
+        self.menuBar().insertMenu(view_menu.menuAction(), edit_menu)
+        self.undo_action = self.undo_stack.createUndoAction(self, "Undo")
+        self.undo_action.setIcon(action_icon("undo"))
+        self.undo_action.setShortcuts(QKeySequence.keyBindings(QKeySequence.StandardKey.Undo))
+        self.redo_action = self.undo_stack.createRedoAction(self, "Redo")
+        self.redo_action.setIcon(action_icon("redo"))
+        self.redo_action.setShortcuts(QKeySequence.keyBindings(QKeySequence.StandardKey.Redo))
+        for action in (self.undo_action, self.redo_action):
+            edit_menu.addAction(action)
+            toolbar.addAction(action)
+        self.undo_action.setIconText("Undo")
+        self.redo_action.setIconText("Redo")
+        remove_point = edit_menu.addAction("Remove last waypoint")
+        remove_point.setShortcut(QKeySequence("Backspace"))
+        remove_point.triggered.connect(self.undo_route_point)
 
         clear_action = QAction("Clear path", self)
         clear_action.setIcon(action_icon("clear-path"))
         clear_action.triggered.connect(self.clear_route)
         toolbar.addAction(clear_action)
 
+        self.calculate_action.setIconText("Calculate")
+        self.export_action.setIconText("Paths DXF")
+        self.save_copy_action.setIconText("Drawing DXF")
         toolbar.addAction(self.calculate_action)
         toolbar.addSeparator()
         toolbar.addAction(self.export_action)
         toolbar.addAction(self.save_copy_action)
+        toolbar.addSeparator()
+        fit_action.setIconText("Fit view")
+        toolbar.addAction(fit_action)
         self.calculate_action.setIcon(action_icon("calculate"))
+        document_toolbar = QToolBar("File and view")
+        document_toolbar.setMovable(False)
+        document_toolbar.setIconSize(QSize(22, 22))
+        document_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.insertToolBar(toolbar, document_toolbar)
+        self.insertToolBarBreak(toolbar)
+        self.editor_toolbars.insert(0, document_toolbar)
+        for action in (self.open_action, self.project_action, self.export_action, self.save_copy_action, fit_action):
+            toolbar.removeAction(action)
+            document_toolbar.addAction(action)
+        # Remove separators left at the ends after moving file commands to their own row.
+        for action in list(toolbar.actions()):
+            if action.isSeparator() and (
+                action == toolbar.actions()[0] or action == toolbar.actions()[-1]
+            ):
+                toolbar.removeAction(action)
+
+        help_menu = self.menuBar().addMenu("&Help")
+        start_action = help_menu.addAction("Getting started")
+        start_action.triggered.connect(self._show_start_screen)
 
     def open_dxf(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
-            "Open site drawing",
+            "Open drawing or project",
             "",
-            "CAD drawings (*.dxf *.dwg);;DXF drawings (*.dxf);;DWG drawings (*.dwg);;All files (*)",
+            "Drawings and projects (*.dwg *.dxf *.oasp);;OpenArch projects (*.oasp);;DXF drawings (*.dxf);;DWG drawings (*.dwg);;All files (*)",
         )
         if filename:
             self.load_drawing(filename)
 
     def load_drawing(self, filename: str) -> None:
+        path = Path(filename)
+        if not self._confirm_replace():
+            return
+        new_tempdir = tempfile.TemporaryDirectory(prefix="openarchsp-")
+        dialog = LoadingDialog(self, path)
+        worker = _LoadWorker(path, Path(new_tempdir.name))
+        worker.signals.progress.connect(dialog.update_stage)
+        worker.signals.finished.connect(dialog.finish)
+        QThreadPool.globalInstance().start(worker)
+        dialog.exec()
+        payload, error = dialog.payload, dialog.error
+        dialog.deleteLater()
+        if payload is None:
+            new_tempdir.cleanup()
+            QMessageBox.critical(self, "Could not open file", error)
+            return
+        document, project, shapes, count, warnings = payload
+        scene, drawing_bounds = make_scene(shapes, self.view)
         self.preview_timer.stop()
         self._preview_generation += 1
-        path = Path(filename)
-        new_tempdir: tempfile.TemporaryDirectory[str] | None = None
-        converted_path: Path | None = None
-        try:
-            if path.suffix.lower() == ".dwg":
-                new_tempdir = tempfile.TemporaryDirectory(prefix="openarchsp-")
-                converted_path = Path(new_tempdir.name) / "imported.dxf"
-                convert_dwg_to_dxf(path, converted_path)
-                document = read_dxf(converted_path)
-            else:
-                document = read_dxf(path)
-            count, drawing_bounds = draw_document(document, self.view.scene)
-        except Exception as error:
-            if new_tempdir:
-                new_tempdir.cleanup()
-            QMessageBox.critical(self, "Could not open drawing", str(error))
-            return
-
-        if self._dwg_tempdir:
-            self._dwg_tempdir.cleanup()
-        self._dwg_tempdir = new_tempdir
-        self._converted_base_path = converted_path
+        previous_scene = self.view.scene
+        self.view.setScene(scene)
+        self.view.scene = scene
+        previous_scene.deleteLater()
+        if self._background_tempdir:
+            self._background_tempdir.cleanup()
+        self._background_tempdir = new_tempdir
+        self._background_file = Path(new_tempdir.name) / "background.dxf"
         self.document = document
         self.drawing_path = path
+        self.project_path = path if project else None
         self.view.drawing_bounds = drawing_bounds
         margin = max(drawing_bounds.width(), drawing_bounds.height(), 1000.0) * 20
         self.view.scene.setSceneRect(
             drawing_bounds.adjusted(-margin, -margin, margin, margin)
         )
-        # draw_document() clears the scene, which also destroys existing overlay items.
+        # All overlay references below belong to the previous scene.
         self.route_items.clear()
         self.route_line_item = None
         self.other_path_items.clear()
@@ -1148,36 +1342,179 @@ class MainWindow(QMainWindow):
         self.envelope_items.clear()
         self.envelope_geometry = None
         self.simulation_result = None
-        self.swept_paths = [
-            SweptPathDocument(
-                uuid.uuid4().hex,
-                "Swept path 1",
-                str(self.vehicle_combo.currentData()),
-                "#f28583",
-                [],
-            )
+        self._path_switching = True
+        selected = self.vehicle_combo.currentData()
+        self.vehicle_definitions = self._load_vehicle_definitions()
+        self.vehicle_geometries = self._load_vehicle_geometries()
+        if project:
+            self.vehicle_definitions.update(project.vehicles)
+            for vehicle_id in project.vehicles:
+                self.vehicle_geometries.pop(vehicle_id, None)
+            self.vehicle_geometries.update(project.geometries)
+        self.vehicle_combo.blockSignals(True)
+        self.vehicle_combo.clear()
+        for vehicle in self.vehicle_definitions.values():
+            self.vehicle_combo.addItem(vehicle.name, vehicle.id)
+        self.vehicle_combo.blockSignals(False)
+        if selected not in self.vehicle_definitions:
+            selected = self.vehicle_combo.itemData(0)
+        self.swept_paths = project.paths if project else [
+            SweptPathDocument(uuid.uuid4().hex, "Swept path 1", selected, "#f28583", [])
         ]
-        self.active_path_id = self.swept_paths[0].id
+        chosen = project.active_id if project else self.swept_paths[0].id
+        self.active_path_id = chosen
         self._refresh_path_picker()
         self._hover_point = None
+        self.view.drawing_mode = False
         self.draw_action.setChecked(False)
-        self.set_drawing_mode(False)
+        self.finish_action.setEnabled(False)
         unit_code = int(document.header.get("$INSUNITS", 0) or 0)
-        self.units_spin.setValue(self._units_per_metre(unit_code))
-        self._render_route()
-        self._update_export_state()
+        self.units_spin.setValue(project.units if project else self._units_per_metre(unit_code))
+        if project:
+            for key, checkbox in self._display_controls().items():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(project.display.get(key, True))
+                checkbox.blockSignals(False)
+        self.active_path_id = ""
+        self._path_selection_changed(self.path_combo.currentIndex())
         self.draw_action.setEnabled(True)
-        self.setWindowTitle(f"OpenArch Swept Paths — {self.drawing_path.name}")
-        unit_text = (
-            "unitless drawing; assuming metres"
-            if unit_code == 0
-            else f"drawing unit code {unit_code}"
-        )
-        import_note = "DWG converted to temporary DXF" if converted_path else "DXF loaded"
-        self.status.showMessage(
-            f"{self.drawing_path} · {count} entities rendered · {unit_text} · {import_note}"
-        )
+        self.setWindowTitle(f"{path.name} | OpenArch Swept Paths")
+        path_count = len(self.swept_paths)
+        path_label = "path" if path_count == 1 else "paths"
+        self.status.showMessage(f"{path.name} · {count:,} drawing entities · {path_count} {path_label}")
+        self._show_editor()
         self.view.fit_drawing()
+        self._saved_state = self._edit_state()
+        self.undo_stack.clear()
+        self._history_current = self._capture_history()
+        if warnings:
+            QMessageBox.warning(self, "Paths requiring review", "\n".join(warnings))
+
+    def _capture_history(self):
+        return EditorState(
+            tuple(PathState(
+                p.id, p.name, p.vehicle_id, p.color, tuple(p.points),
+                tuple(p.vehicle_stations),
+                self._settings() if p.id == self.active_path_id else p.settings
+            ) for p in self.swept_paths),
+            self.active_path_id, self.units_spin.value(),
+            dict(self.vehicle_definitions), dict(self.vehicle_geometries),
+            tuple(c.isChecked() for c in self._display_controls().values())
+        )
+
+    def _record_edit(self, label):
+        if self.document is None or self._history_restoring:
+            return
+        after = self._capture_history()
+        before = self._history_current
+        self._history_current = after
+        if before is not None and before != after:
+            self.undo_stack.push(EditCommand(self, label, before, after))
+
+    def _restore_history(self, state):
+        drawing = self.view.drawing_mode and state.active_id == self.active_path_id
+        previous_paths = {p.id: p for p in self.swept_paths}
+        previous_geometry = self.vehicle_geometries
+        previous_units = self.units_spin.value()
+        self.active_path.settings = self._settings()
+        self._history_restoring = True
+        self.preview_timer.stop()
+        self._preview_generation += 1
+        self._path_switching = True
+        self.vehicle_definitions = dict(state.vehicles)
+        self.vehicle_geometries = dict(state.geometries)
+        self.vehicle_combo.blockSignals(True)
+        self.vehicle_combo.clear()
+        for vehicle in self.vehicle_definitions.values():
+            self.vehicle_combo.addItem(vehicle.name, vehicle.id)
+        self.vehicle_combo.blockSignals(False)
+        self.units_spin.setValue(state.units)
+        for checkbox, visible in zip(self._display_controls().values(), state.display):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(visible)
+            checkbox.blockSignals(False)
+        self.swept_paths = [
+            SweptPathDocument(p.id, p.name, p.vehicle_id, p.color, list(p.points),
+                              simulation_scale=state.units, vehicle_stations=list(p.stations),
+                              settings=p.settings) for p in state.paths
+        ]
+        for index, restored in enumerate(self.swept_paths):
+            previous = previous_paths.get(restored.id)
+            if (previous is not None and previous_units == state.units
+                    and previous.points == restored.points
+                    and previous.settings == restored.settings
+                    and previous.vehicle_id == restored.vehicle_id
+                    and previous_geometry.get(previous.vehicle_id) == state.geometries.get(restored.vehicle_id)):
+                self.swept_paths[index] = replace(
+                    restored, simulation_result=previous.simulation_result,
+                    envelope_geometry=previous.envelope_geometry,
+                    detailed=previous.detailed
+                )
+        self.active_path_id = state.active_id
+        self._refresh_path_picker()
+        self.active_path_id = ""
+        self._path_selection_changed(self.path_combo.currentIndex())
+        # Background items are never recreated by an edit.
+        for item in self.view.scene.items():
+            group = item.data(0)
+            checkbox = {"outside": self.outside_visible, "vehicle": self.vehicle_visible,
+                        "wheel": self.wheels_visible}.get(group)
+            if checkbox is not None:
+                item.setVisible(checkbox.isChecked())
+        if drawing:
+            self.draw_action.setChecked(True)
+            self.set_drawing_mode(True)
+        self._history_current = self._capture_history()
+        self._history_restoring = False
+
+    def _display_controls(self):
+        return {name: getattr(self, name) for name in (
+            "outside_visible", "vehicle_visible", "wheels_visible", "show_start_position", "show_end_position"
+        )}
+
+    def _edit_state(self):
+        active = self._settings()
+        return (self.units_spin.value(), tuple(
+            (p.id, p.name, p.vehicle_id, p.color, tuple(p.points), tuple(p.vehicle_stations),
+             active if p.id == self.active_path_id else p.settings,
+             self.vehicle_geometries.get(p.vehicle_id)) for p in self.swept_paths
+        ), tuple(c.isChecked() for c in self._display_controls().values()))
+
+    def _confirm_replace(self):
+        if self.document is None or self._edit_state() == self._saved_state:
+            return True
+        buttons = QMessageBox.StandardButton
+        choice = QMessageBox.question(self, "Save project changes?", "Save changes before closing this drawing?",
+                                      buttons.Save | buttons.Discard | buttons.Cancel, buttons.Save)
+        return choice == buttons.Discard or (choice == buttons.Save and self.save_editable_project())
+
+    def save_editable_project(self, _checked=False, *, save_as=False):
+        if self.document is None:
+            return False
+        target = self.project_path
+        if target is None or save_as:
+            filename, _ = QFileDialog.getSaveFileName(self, "Save editable project",
+                str((target or self.drawing_path).with_suffix(".oasp")), "OpenArch projects (*.oasp)")
+            if not filename:
+                return False
+            target = Path(filename)
+            if target.suffix.lower() != ".oasp":
+                target = target.with_suffix(".oasp")
+        self.active_path.settings = self._settings()
+        project = Project(self.swept_paths, self.active_path_id, self.units_spin.value(),
+                          self.vehicle_definitions, self.vehicle_geometries,
+                          {k: c.isChecked() for k, c in self._display_controls().items()})
+        try:
+            save_project(target, self._background_file, project)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not save project", str(error))
+            return False
+        self.project_path = target
+        self.undo_stack.setClean()
+        self._saved_state = self._edit_state()
+        self.setWindowTitle(f"{target.name} | OpenArch Swept Paths")
+        self.status.showMessage(f"Project saved to {target}")
+        return True
 
     @staticmethod
     def _units_per_metre(unit_code: int) -> float:
@@ -1196,6 +1533,7 @@ class MainWindow(QMainWindow):
         vehicle_id = str(self.vehicle_combo.currentData())
         return self.vehicle_definitions[vehicle_id]
 
+    @undoable("Change vehicle")
     def _vehicle_selected(self, _index: int = 0) -> None:
         vehicle = self._selected_vehicle()
         if not self._path_switching:
@@ -1213,6 +1551,7 @@ class MainWindow(QMainWindow):
             self.draw_action.setText(
                 "Draw steer-axle path" if has_geometry else "Draw reference path"
             )
+        self.draw_action.setIconText("Draw path")
         self.length_spin.setEnabled(not has_geometry)
         self.width_spin.setEnabled(not has_geometry)
         if has_geometry:
@@ -1224,12 +1563,12 @@ class MainWindow(QMainWindow):
             self.length_spin.setValue(vehicle.length_m)
             self.width_spin.setValue(vehicle.width_m)
         self.steering_limit_spin.setEnabled(has_geometry)
-        if vehicle.source_url:
-            source = f'<a href="{vehicle.source_url}">{vehicle.source}</a>'
+        if urlsplit(vehicle.source_url).scheme in ("http", "https"):
+            source = f'<a style="color:#9bcdbd" href="{escape(vehicle.source_url)}">{escape(vehicle.source)}</a>'
             self.vehicle_source_label.setText(source)
             self.vehicle_source_label.setOpenExternalLinks(True)
         else:
-            self.vehicle_source_label.setText(vehicle.source)
+            self.vehicle_source_label.setText(escape(vehicle.source))
 
         self.save_vehicle_button.setEnabled(vehicle.supports_preview)
         self.edit_geometry_button.setEnabled(True)
@@ -1258,21 +1597,39 @@ class MainWindow(QMainWindow):
         if not self._path_switching:
             self._queue_live_preview()
 
+    @undoable("Change path settings")
     def _vehicle_dimensions_changed(self, _value: float = 0.0) -> None:
         if self._path_switching:
             return
-        for path in self.swept_paths:
-            path.simulation_result = None
-            path.envelope_geometry = None
+        self.active_path.settings = self._settings()
         self._clear_envelope()
         self._render_other_paths()
         self._update_export_state()
         self._queue_live_preview()
 
+    @undoable("Change drawing scale")
+    def _drawing_scale_changed(self):
+        if not self._path_switching:
+            for path in self.swept_paths:
+                path.simulation_result = None
+                path.envelope_geometry = None
+                path.simulation_scale = self.units_spin.value()
+            self._vehicle_dimensions_changed()
+
+    def _settings(self) -> PathSettings:
+        return PathSettings(**{
+            field.name: getattr(self, field.name + "_spin").value() for field in fields(PathSettings)
+        })
+
+    def _apply_settings(self, settings):
+        if settings is not None:
+            for field in fields(settings):
+                getattr(self, field.name + "_spin").setValue(getattr(settings, field.name))
+
     def _queue_live_preview(self) -> None:
         self._preview_generation += 1
         self._preview_show_errors = False
-        self._preview_fast = True
+        self._preview_fast = self.view.drawing_mode
         if len(self._current_preview_route()) >= 2 and self.document is not None:
             self.preview_timer.start()
         else:
@@ -1312,6 +1669,7 @@ class MainWindow(QMainWindow):
             return "Steer-axle path"
         return "Reference path"
 
+    @undoable("Edit vehicle geometry")
     def edit_vehicle_geometry(self) -> None:
         vehicle = self._selected_vehicle()
         dialog = GeometryDialog(
@@ -1338,6 +1696,7 @@ class MainWindow(QMainWindow):
         self._render_other_paths()
         self.status.showMessage(f"Saved kinematic geometry for {vehicle.name}")
 
+    @undoable("Save custom vehicle")
     def save_custom_vehicle(self) -> None:
         name, accepted = QInputDialog.getText(
             self, "Save custom vehicle", "Vehicle profile name:"
@@ -1382,7 +1741,7 @@ class MainWindow(QMainWindow):
             )
             self.status.showMessage(
                 f"Move the cursor to preview the next {path_name} point, then click to add it · "
-                "Right-click or Enter to finish · Esc to stop drawing"
+                "Esc, double-click or Finish path to finish"
             )
         else:
             self._preview_generation += 1
@@ -1394,9 +1753,12 @@ class MainWindow(QMainWindow):
         if not enabled:
             self._queue_live_preview()
 
+    @undoable("Add waypoint")
     def add_route_point(self, scene_x: float, scene_y: float) -> None:
         self._hover_point = None
         self._render_hover_cursor()
+        if self.route_points and math.dist(self.route_points[-1], (scene_x, scene_y)) < 1e-6:
+            return
         self.route_points.append((scene_x, scene_y))
         self._clear_envelope()
         self._render_route()
@@ -1423,6 +1785,7 @@ class MainWindow(QMainWindow):
                     f"{self._route_label()} complete · {len(self.route_points)} points"
                 )
 
+    @undoable("Remove last waypoint")
     def undo_route_point(self) -> None:
         if not self.route_points:
             return
@@ -1433,6 +1796,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"{self._route_label()}: {len(self.route_points)} points")
         self._queue_live_preview()
 
+    @undoable("Clear path")
     def clear_route(self) -> None:
         self.preview_timer.stop()
         self._preview_generation += 1
@@ -1511,6 +1875,9 @@ class MainWindow(QMainWindow):
         else:
             self._render_route()
         self._queue_live_preview()
+        self._preview_fast = live
+        if not live:
+            self._record_edit("Move waypoint")
 
     def _render_other_paths(self) -> None:
         for item in self.other_path_items:
@@ -1656,25 +2023,8 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Preview unavailable · vehicle geometry is required")
             return
         scale = self.units_spin.value()
-        run_geometry = (
-            replace(geometry, max_steer_deg=self.steering_limit_spin.value())
-            if geometry is not None
-            else None
-        )
         self._clear_envelope()
-        worker = _PreviewWorker(
-            token,
-            route,
-            run_geometry,
-            fast_preview=fast_preview,
-            scale=scale,
-            corner_radius_m=self.corner_radius_spin.value(),
-            spacing_m=2.0 if fast_preview else 0.25,
-            speed_kmh=self.speed_spin.value(),
-            lock_to_lock_s=self.lock_to_lock_spin.value(),
-            rigid_length=self.length_spin.value(),
-            rigid_width=self.width_spin.value(),
-        )
+        worker = _PreviewWorker(token, route, geometry, self._settings(), scale, fast_preview)
         worker.signals.finished.connect(self._preview_completed)
         self._preview_running = True
         self._update_export_state()
@@ -1699,6 +2049,7 @@ class MainWindow(QMainWindow):
         else:
             result, envelope = payload
             self.envelope_geometry = envelope
+            self.active_path.detailed = not self._preview_fast
             self.active_path.simulation_result = result
             self.active_path.envelope_geometry = envelope
             self.active_path.simulation_scale = self.units_spin.value()
@@ -1991,6 +2342,8 @@ class MainWindow(QMainWindow):
             and not self._preview_running
             and not self.preview_timer.isActive()
         )
+        self.project_action.setEnabled(self.document is not None)
+        self.project_as_action.setEnabled(self.document is not None)
         self.export_action.setEnabled(has_path)
         self.save_copy_action.setEnabled(has_path)
         vehicle = self._selected_vehicle()
@@ -2010,7 +2363,7 @@ class MainWindow(QMainWindow):
         if self.drawing_path and Path(target).resolve() == self.drawing_path.resolve():
             raise ValueError("Choose a new output file so the source drawing is preserved.")
         if include_base and self.drawing_path:
-            output = read_dxf(self._converted_base_path or self.drawing_path)
+            output = read_dxf(self._background_file or self.drawing_path)
         else:
             output = ezdxf.new("R2010")
             if self.document is not None:
@@ -2019,6 +2372,17 @@ class MainWindow(QMainWindow):
         modelspace = output.modelspace()
         for path_index, path_document in enumerate(self.swept_paths, start=1):
             if len(path_document.points) >= 2:
+                vehicle = self.vehicle_definitions[path_document.vehicle_id]
+                geometry = self.vehicle_geometries.get(vehicle.id)
+                if (path_document.envelope_geometry is None or not path_document.detailed) and (
+                    geometry or vehicle.supports_preview
+                ):
+                    settings = self._settings() if path_document is self.active_path else path_document.settings
+                    path_document.simulation_result, path_document.envelope_geometry = calculate_path(
+                        path_document.points, geometry, settings, self.units_spin.value(), False
+                    )
+                    path_document.simulation_scale = self.units_spin.value()
+                    path_document.detailed = True
                 self._write_path_dxf(modelspace, output, path_document, path_index)
         output.saveas(target)
 
@@ -2312,9 +2676,12 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Saved drawing copy with swept paths to {target}")
 
     def closeEvent(self, event: object) -> None:
-        if self._dwg_tempdir:
-            self._dwg_tempdir.cleanup()
-            self._dwg_tempdir = None
+        if not self._confirm_replace():
+            event.ignore()
+            return
+        if self._background_tempdir:
+            self._background_tempdir.cleanup()
+            self._background_tempdir = None
         super().closeEvent(event)
 
 
@@ -2324,6 +2691,8 @@ def main() -> None:
     app.setWindowIcon(QIcon(str(asset_path("app-icon.svg"))))
     window = MainWindow()
     window.show()
+    if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
+        QTimer.singleShot(0, lambda: window.load_drawing(sys.argv[1]))
     sys.exit(app.exec())
 
 

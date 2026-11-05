@@ -5,12 +5,21 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Sequence
 
-from shapely.geometry import Polygon
+from shapely.geometry import GeometryCollection, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 
 Point = tuple[float, float]
+
+
+def swept_spans(poses: Iterable[Polygon]) -> Iterable[Polygon]:
+    """Bridge adjacent poses of a single convex component, keeping bends local."""
+    previous = None
+    for current in poses:
+        if previous is not None:
+            yield GeometryCollection([previous, current]).convex_hull
+        previous = current
 
 
 def _rectangle(center: Point, heading: float, length: float, width: float) -> Polygon:
@@ -106,7 +115,7 @@ def swept_footprint(
                     )
                 )
 
-    result = unary_union(footprints)
+    result = unary_union(list(swept_spans(footprints)))
     if result.is_empty or not result.is_valid:
         raise ValueError("Could not create a valid vehicle footprint for this path.")
     return result

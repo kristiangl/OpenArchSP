@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import math
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from collections.abc import Callable
+
+from openarchsp.project import calculate_path, load_project
 
 import ezdxf
 from ezdxf.document import Drawing
 from PySide6.QtCore import QRectF
 from PySide6.QtGui import QColor, QPainterPath, QPen
-from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsScene
+from PySide6.QtWidgets import QGraphicsScene
 
 
 def read_dxf(path: str | Path) -> Drawing:
@@ -35,6 +39,7 @@ def convert_dwg_to_dxf(source: str | Path, destination: str | Path) -> None:
         result = subprocess.run(
             [str(helper), str(source), str(destination)],
             capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             text=True,
             timeout=1800,
             check=False,
@@ -94,30 +99,71 @@ def _entity_path(entity: object) -> QPainterPath | None:
     return path
 
 
-def draw_document(document: Drawing, scene: QGraphicsScene) -> tuple[int, QRectF]:
-    """Render common 2D model-space entities and return count and bounds."""
-    scene.clear()
-    bounds = QRectF()
+def prepare_background(source: Path, directory: Path, progress: Callable[[str, int], None]):
+    """Read and prepare independent Qt paths off the GUI thread."""
+    base = directory / "background.dxf"
+    project = None
+    warnings = []
+    if source.suffix.lower() == ".oasp":
+        progress("Opening project…", -1)
+        project = load_project(source, base)
+    elif source.suffix.lower() == ".dwg":
+        progress("Converting DWG to DXF…", -1)
+        convert_dwg_to_dxf(source, base)
+    else:
+        progress("Reading drawing…", -1)
+        shutil.copyfile(source, base)
+    progress("Reading DXF geometry…", -1)
+    document = read_dxf(base)
+    shapes = []
+    batch = QPainterPath()
+    model = document.modelspace()
+    total = len(model)
     rendered = 0
+    last_percent = -1
+    for index, entity in enumerate(model, 1):
+        shape = _entity_path(entity)
+        if shape is not None:
+            batch.addPath(shape)
+            rendered += 1
+            if rendered % 128 == 0:
+                shapes.append(batch)
+                batch = QPainterPath()
+        percent = index * 100 // total
+        if percent != last_percent:
+            progress("Preparing drawing…", percent)
+            last_percent = percent
+    if not batch.isEmpty():
+        shapes.append(batch)
+    if project:
+        for index, path in enumerate(project.paths):
+            progress(f"Restoring path {index + 1} of {len(project.paths)}…", -1)
+            geometry = project.geometries.get(path.vehicle_id)
+            if len(path.points) >= 2 and (geometry or project.vehicles[path.vehicle_id].supports_preview):
+                try:
+                    path.simulation_result, path.envelope_geometry = calculate_path(
+                        path.points, geometry, path.settings, project.units, False
+                    )
+                    path.detailed = True
+                except ValueError as error:
+                    warnings.append(f"{path.name}: {error}")
+    return document, project, shapes, rendered, warnings
+
+
+def make_scene(shapes, parent) -> tuple[QGraphicsScene, QRectF]:
+    scene = QGraphicsScene(parent)
+    bounds = QRectF()
     pen = QPen(QColor("#89939e"))
     pen.setCosmetic(True)
     pen.setWidthF(0.0)
+    for shape in shapes:
+        item = scene.addPath(shape, pen)
+        bounds = bounds.united(item.boundingRect())
 
-    for entity in document.modelspace():
-        shape = _entity_path(entity)
-        if shape is None:
-            continue
-        item = QGraphicsPathItem(shape)
-        item.setPen(pen)
-        scene.addItem(item)
-        item_bounds = item.sceneBoundingRect()
-        bounds = item_bounds if rendered == 0 else bounds.united(item_bounds)
-        rendered += 1
-
-    if rendered:
+    if shapes:
         bounds = bounds.adjusted(-1, -1, 1, 1)
         scene.setSceneRect(bounds)
     else:
         bounds = QRectF(-10, -10, 20, 20)
         scene.setSceneRect(bounds)
-    return rendered, bounds
+    return scene, bounds
