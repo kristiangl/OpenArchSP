@@ -1491,6 +1491,13 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.vehicle_dock.toggleViewAction())
         view_menu.addAction(self.display_dock.toggleViewAction())
 
+        vehicle_menu = self.menuBar().addMenu("&Vehicle")
+        self.reverse_action = QAction("Direction: Forward", self)
+        self.reverse_action.setCheckable(True)
+        self.reverse_action.setToolTip("Toggle forward and reverse travel for this path")
+        self.reverse_action.toggled.connect(self._direction_toggled)
+        vehicle_menu.addAction(self.reverse_action)
+
         toolbar = QToolBar("Path")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(22, 22))
@@ -1594,12 +1601,6 @@ class MainWindow(QMainWindow):
             ):
                 toolbar.removeAction(action)
 
-        vehicle_menu = self.menuBar().addMenu("&Vehicle")
-        self.reverse_action = QAction("Direction: Forward", self)
-        self.reverse_action.setCheckable(True)
-        self.reverse_action.setToolTip("Toggle forward and reverse travel for this path")
-        self.reverse_action.toggled.connect(self._direction_toggled)
-        vehicle_menu.addAction(self.reverse_action)
         help_menu = self.menuBar().addMenu("&Help")
         self.update_action = help_menu.addAction("Check for Updates…")
         self.update_action.triggered.connect(lambda: self.check_for_updates(manual=True))
