@@ -25,6 +25,8 @@ class PathSettings:
     speed: float
     steering_limit: float
     lock_to_lock: float
+    dry_steering: bool = False
+    reverse: bool = False
 
 
 @dataclass
@@ -40,6 +42,7 @@ class SweptPathDocument:
     vehicle_stations: list[float] = field(default_factory=list)
     settings: PathSettings | None = None
     detailed: bool = False
+    clearance_summary: dict | None = None
 
 
 def calculate_path(route, geometry, settings: PathSettings, units: float, fast: bool):
@@ -51,6 +54,8 @@ def calculate_path(route, geometry, settings: PathSettings, units: float, fast: 
         replace(geometry, max_steer_deg=settings.steering_limit),
         corner_radius_m=settings.corner_radius, spacing_m=2.0 if fast else 0.25,
         speed_kmh=settings.speed, lock_to_lock_s=settings.lock_to_lock,
+        dry_steering=settings.dry_steering,
+        reverse=settings.reverse,
         integration_step_s=0.32 if fast else 0.05, envelope_pose_stride=4 if fast else 1,
     )
     return result, scale_geometry(result.envelope, xfact=units, yfact=units, origin=(0, 0))
@@ -64,6 +69,7 @@ class Project:
     vehicles: dict[str, VehicleDefinition]
     geometries: dict[str, CombinationGeometry]
     display: dict[str, bool]
+    clearance_layers: list[str] = field(default_factory=list)
 
 
 def save_project(target: Path, background: Path, project: Project) -> None:
@@ -71,12 +77,12 @@ def save_project(target: Path, background: Path, project: Project) -> None:
     for path in project.paths:
         paths.append(dict(id=path.id, name=path.name, vehicle_id=path.vehicle_id,
                           color=path.color, points=path.points, stations=path.vehicle_stations,
-                          settings=asdict(path.settings)))
+                          settings=asdict(path.settings), clearance_summary=path.clearance_summary))
     used = {path.vehicle_id for path in project.paths}
     manifest = dict(version=1, paths=paths, active_id=project.active_id, units=project.units,
                     vehicles=[project.vehicles[key].to_dict() for key in sorted(used)],
                     geometries={k: v.to_dict() for k, v in project.geometries.items() if k in used},
-                    display=project.display)
+                    display=project.display, clearance_layers=project.clearance_layers)
     # Replace only after both members have been written successfully.
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as temp:
         temporary = Path(temp.name)
@@ -101,20 +107,27 @@ def load_project(source: Path, background: Path) -> Project:
             raise ValueError("Invalid project drawing scale.")
         paths = []
         for entry in data["paths"]:
-            settings = PathSettings(**{k: float(v) for k, v in entry["settings"].items()})
+            settings = PathSettings(**{
+                k: bool(v) if k in ("dry_steering", "reverse") else float(v)
+                for k, v in entry["settings"].items()
+            })
             points = [(float(x), float(y)) for x, y in entry["points"]]
             stations = [float(value) for value in entry["stations"]]
             if (entry["vehicle_id"] not in vehicles
                     or not all(math.isfinite(v) for xy in points for v in xy)
                     or not all(0 <= value <= 1 for value in stations)
-                    or not all(math.isfinite(v) and v > 0 for v in asdict(settings).values())):
+                    or not all(
+                        math.isfinite(getattr(settings, key)) and getattr(settings, key) > 0
+                        for key in ("length", "width", "corner_radius", "speed", "steering_limit", "lock_to_lock")
+                    )):
                 raise ValueError("Invalid swept path in project.")
             for key in ("id", "name", "color"):
                 if not isinstance(entry[key], str) or not entry[key]:
                     raise ValueError("Invalid swept path details.")
             paths.append(SweptPathDocument(entry["id"], entry["name"], entry["vehicle_id"],
                                            entry["color"], points, vehicle_stations=stations,
-                                           settings=settings, simulation_scale=units))
+                                           settings=settings, simulation_scale=units,
+                                           clearance_summary=entry.get("clearance_summary")))
         ids = {path.id for path in paths}
         if len(ids) != len(paths) or data["active_id"] not in ids:
             raise ValueError("Invalid project path selection.")
@@ -123,4 +136,7 @@ def load_project(source: Path, background: Path) -> Project:
             raise ValueError("Invalid project display options.")
         with archive.open("background.dxf") as member, background.open("wb") as dest:
             shutil.copyfileobj(member, dest)
-    return Project(paths, data["active_id"], units, vehicles, geometries, display)
+    clearance_layers = data.get("clearance_layers", [])
+    if not isinstance(clearance_layers, list) or not all(isinstance(x, str) for x in clearance_layers):
+        raise ValueError("Invalid clearance layer selection.")
+    return Project(paths, data["active_id"], units, vehicles, geometries, display, clearance_layers)

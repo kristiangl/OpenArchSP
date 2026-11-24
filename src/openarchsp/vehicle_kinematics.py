@@ -16,8 +16,6 @@ from shapely.geometry import Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
-from openarchsp.swept_path import swept_spans
-
 
 Point = tuple[float, float]
 
@@ -215,6 +213,7 @@ class SimulationResult:
     steering_rate_saturated: bool
     maximum_path_error_m: float
     path_complete: bool
+    dry_steering: bool = False
 
 
 def _unit(angle: float) -> Point:
@@ -254,10 +253,65 @@ def _append_sample(
     samples.append(RouteSample(point, heading, curvature, total))
 
 
+def _transition_curve_samples(
+    turn: float, radius_m: float, spacing_m: float
+) -> tuple[tuple[Point, float, float], ...]:
+    """Create a sampled straight-to-curve-to-straight path with continuous curvature."""
+    angle = abs(turn)
+    turn_sign = 1.0 if turn > 0 else -1.0
+    ramp_angle = min(angle / 4, math.radians(15))
+    ramp_length = radius_m * ramp_angle
+    circular_length = radius_m * (angle - ramp_angle)
+    curve: list[tuple[Point, float, float]] = [((0.0, 0.0), 0.0, 0.0)]
+    point = (0.0, 0.0)
+    heading = 0.0
+
+    phases = (
+        (ramp_length, "in"),
+        (circular_length, "arc"),
+        (ramp_length, "out"),
+    )
+    for phase_length, phase in phases:
+        steps = max(1, math.ceil(phase_length / spacing_m))
+        ds = phase_length / steps if phase_length > 0 else 0.0
+        for step in range(steps):
+            if phase == "in":
+                curvature = (step + 0.5) * ds / (radius_m * ramp_length)
+                end_curvature = (step + 1) * ds / (radius_m * ramp_length)
+            elif phase == "arc":
+                curvature = end_curvature = 1.0 / radius_m
+            else:
+                curvature = 1.0 / radius_m * (
+                    1.0 - (step + 0.5) * ds / ramp_length
+                )
+                end_curvature = 1.0 / radius_m * (
+                    1.0 - (step + 1) * ds / ramp_length
+                )
+            signed_curvature = turn_sign * curvature
+            next_heading = heading + signed_curvature * ds
+            if abs(signed_curvature) < 1e-12:
+                point = (
+                    point[0] + ds * math.cos(heading),
+                    point[1] + ds * math.sin(heading),
+                )
+            else:
+                point = (
+                    point[0] + (math.sin(next_heading) - math.sin(heading)) / signed_curvature,
+                    point[1] + (math.cos(heading) - math.cos(next_heading)) / signed_curvature,
+                )
+            heading = next_heading
+            curve.append((point, heading, turn_sign * end_curvature))
+
+    # The symmetric curvature profile has this exact final heading; remove round-off.
+    last_point, _last_heading, _last_curvature = curve[-1]
+    curve[-1] = (last_point, turn, 0.0)
+    return tuple(curve)
+
+
 def smooth_steer_axle_path(
     route: Sequence[Point], corner_radius_m: float, spacing_m: float
 ) -> tuple[RouteSample, ...]:
-    """Round clicked waypoints with tangent circular arcs and sample the path."""
+    """Smooth waypoint turns with curvature ramps and sample the path."""
     if corner_radius_m <= 0 or spacing_m <= 0:
         raise ValueError("Corner radius and sampling spacing must be positive.")
     points: list[Point] = []
@@ -276,7 +330,10 @@ def smooth_steer_axle_path(
         segment_lengths.append(length)
         directions.append((delta[0] / length, delta[1] / length))
 
-    corner_data: dict[int, tuple[float, float, float, Point, Point]] = {}
+    curve_spacing_m = min(spacing_m, max(0.25, corner_radius_m / 20))
+    corner_data: dict[
+        int, tuple[float, Point, Point, float, tuple[tuple[Point, float, float], ...]]
+    ] = {}
     setbacks: dict[int, float] = {}
     for index in range(1, len(points) - 1):
         incoming, outgoing = directions[index - 1], directions[index]
@@ -288,10 +345,11 @@ def smooth_steer_axle_path(
             continue
         if abs(abs(turn) - math.pi) < math.radians(2):
             raise ValueError("A near-reversal waypoint cannot be rounded as a tangent turn.")
-        tangent = math.tan(abs(turn) / 2)
-        setback = corner_radius_m * tangent
+        curve = _transition_curve_samples(turn, corner_radius_m, curve_spacing_m)
+        curve_end = curve[-1][0]
+        setback = math.hypot(*curve_end) / (2 * math.cos(abs(turn) / 2))
         setbacks[index] = setback
-        corner_data[index] = (turn, tangent, setback, incoming, outgoing)
+        corner_data[index] = (turn, incoming, outgoing, setback, curve)
 
     # Reduce neighbouring fillets only where their tangent points would overlap.
     corner_scale = {index: 1.0 for index in setbacks}
@@ -311,18 +369,12 @@ def smooth_steer_axle_path(
 
     tangent_in: dict[int, Point] = {}
     tangent_out: dict[int, Point] = {}
-    arcs: dict[int, tuple[Point, float, float, float]] = {}
-    for index, (turn, tangent, setback, incoming, _outgoing) in corner_data.items():
+    for index, (turn, incoming, outgoing, setback, _curve) in corner_data.items():
         effective_setback = setback * corner_scale[index]
-        radius = effective_setback / tangent
         entry = _sub(points[index], _scale(incoming, effective_setback))
-        exit_point = _add(points[index], _scale(directions[index], effective_setback))
-        side = 1.0 if turn > 0 else -1.0
-        center = _add(entry, _scale(_normal(math.atan2(incoming[1], incoming[0])), side * radius))
-        start_angle = math.atan2(entry[1] - center[1], entry[0] - center[0])
+        exit_point = _add(points[index], _scale(outgoing, effective_setback))
         tangent_in[index] = entry
         tangent_out[index] = exit_point
-        arcs[index] = center, start_angle, turn, radius
 
     samples: list[RouteSample] = []
     cursor = points[0]
@@ -347,16 +399,26 @@ def smooth_steer_axle_path(
                      cursor[1] + (entry[1] - cursor[1]) * fraction)
             _append_sample(samples, point, line_heading, 0.0)
 
-        if corner_index in arcs:
-            center, start_angle, turn, radius = arcs[corner_index]
-            arc_length = abs(turn) * radius
-            steps = max(1, math.ceil(arc_length / spacing_m))
-            side = 1.0 if turn > 0 else -1.0
-            for step in range(1, steps + 1):
-                angle = start_angle + turn * step / steps
-                point = (center[0] + radius * math.cos(angle),
-                         center[1] + radius * math.sin(angle))
-                _append_sample(samples, point, angle + side * math.pi / 2, side / radius)
+        if corner_index in corner_data:
+            _turn, incoming, _outgoing, _setback, curve = corner_data[corner_index]
+            base_heading = math.atan2(incoming[1], incoming[0])
+            scale = corner_scale[corner_index]
+            entry = tangent_in[corner_index]
+            exit_point = tangent_out[corner_index]
+            cosine, sine = math.cos(base_heading), math.sin(base_heading)
+            for curve_index, (local_point, local_heading, curvature) in enumerate(curve[1:], start=1):
+                point = (
+                    entry[0] + scale * (local_point[0] * cosine - local_point[1] * sine),
+                    entry[1] + scale * (local_point[0] * sine + local_point[1] * cosine),
+                )
+                if curve_index == len(curve) - 1:
+                    point = exit_point
+                _append_sample(
+                    samples,
+                    point,
+                    base_heading + local_heading,
+                    curvature / scale,
+                )
         cursor = tangent_out.get(corner_index, points[corner_index])
 
     final_point = points[-1]
@@ -502,14 +564,18 @@ def simulate_combination(
     lock_to_lock_s: float = 6.0,
     integration_step_s: float = 0.05,
     envelope_pose_stride: int = 1,
+    reverse: bool = False,
+    dry_steering: bool = False,
     max_poses: int = 60_000,
 ) -> SimulationResult:
-    """Simulate a forward combination with rate-limited steer-axle path following.
+    """Simulate a vehicle combination moving forward or in reverse.
 
     The lead unit uses a bicycle model and pure-pursuit driver. Its road-wheel
-    steering angle changes at the configured lock-to-lock rate, so the actual
-    steer-axle path can deviate from the rounded target path. Towed units follow
-    their front couplings with a no-lateral-slip rear axle constraint.
+    steering angle changes at the configured lock-to-lock rate unless dry
+    steering is enabled, in which case steering adjustments are made while
+    stationary and do not limit the spatial path. In reverse, the
+    lead body starts facing opposite the route direction and travels backward;
+    towed units follow their couplings with a no-lateral-slip rear axle constraint.
     """
     geometry.validate()
     if speed_kmh <= 0 or lock_to_lock_s <= 0 or integration_step_s <= 0:
@@ -530,7 +596,8 @@ def simulate_combination(
     target_distances = [sample.distance_m for sample in target_samples]
     total_target_length = target_distances[-1]
 
-    heading = target_samples[0].heading_rad
+    direction_sign = -1.0 if reverse else 1.0
+    heading = target_samples[0].heading_rad + (math.pi if reverse else 0.0)
     steering_angle = 0.0
     rear_axle = _sub(target_samples[0].point, _scale(_unit(heading), geometry.steer_axle_m))
     lead_poses: list[tuple[Point, float]] = [(rear_axle, heading)]
@@ -561,25 +628,34 @@ def simulate_combination(
         aim = _point_at_distance(target_s, target_samples, target_distances)
         chord = _sub(aim, front)
         chord_length = max(math.hypot(*chord), 0.1)
-        front_course = heading + steering_angle
+        front_course = heading + steering_angle + (math.pi if reverse else 0.0)
         aim_angle = math.atan2(chord[1], chord[0])
         heading_error = _wrap_angle(aim_angle - front_course)
         desired_curvature = 2 * math.sin(heading_error) / chord_length
-        curvature_rate = speed / max(math.cos(steering_angle), 1e-4) * (
-            desired_curvature - math.sin(steering_angle) / geometry.steer_axle_m
-        )
-        if abs(curvature_rate) > maximum_steer_rate:
+        if reverse:
+            desired_steering = math.atan(-geometry.steer_axle_m * desired_curvature)
+            steering_rate = (desired_steering - steering_angle) / dt
+        else:
+            desired_steering = math.atan(geometry.steer_axle_m * desired_curvature)
+            curvature_rate = speed / max(math.cos(steering_angle), 1e-4) * (
+                desired_curvature - math.sin(steering_angle) / geometry.steer_axle_m
+            )
+            steering_rate = curvature_rate
+        if not dry_steering and abs(steering_rate) > maximum_steer_rate:
             steering_rate_saturated = True
-        steering_rate = min(max(curvature_rate, -maximum_steer_rate), maximum_steer_rate)
-        next_steering = min(
-            maximum_steer,
-            max(-maximum_steer, steering_angle + steering_rate * dt),
-        )
+        if dry_steering:
+            next_steering = desired_steering
+        else:
+            steering_rate = min(max(steering_rate, -maximum_steer_rate), maximum_steer_rate)
+            next_steering = steering_angle + steering_rate * dt
+        next_steering = min(maximum_steer, max(-maximum_steer, next_steering))
 
         mid_steering = (steering_angle + next_steering) / 2
-        yaw_rate = speed / geometry.steer_axle_m * math.tan(mid_steering)
+        yaw_rate = direction_sign * speed / geometry.steer_axle_m * math.tan(mid_steering)
         mid_heading = heading + yaw_rate * dt / 2
-        next_rear_axle = _add(rear_axle, _scale(_unit(mid_heading), speed * dt))
+        next_rear_axle = _add(
+            rear_axle, _scale(_unit(mid_heading), direction_sign * speed * dt)
+        )
         next_heading = heading + yaw_rate * dt
         next_front = _add(next_rear_axle, _scale(_unit(next_heading), geometry.steer_axle_m))
         actual_distances.append(actual_distances[-1] + math.dist(steer_points[-1], next_front))
@@ -617,7 +693,7 @@ def simulate_combination(
         )
         front_wheel_angles.append((math.degrees(left_angle), math.degrees(right_angle)))
 
-    max_steer_rate = max(
+    max_steer_rate = 0.0 if dry_steering else max(
         (
             abs(steering[index + 1] - steering[index])
             / dt
@@ -627,7 +703,7 @@ def simulate_combination(
         ),
         default=0.0,
     )
-    allowed_steer_rate = math.degrees(maximum_steer_rate)
+    allowed_steer_rate = 0.0 if dry_steering else math.degrees(maximum_steer_rate)
     all_poses: list[list[tuple[Point, float]]] = [lead_poses]
     articulation_values: list[list[float]] = [[0.0] * len(samples)]
 
@@ -711,21 +787,41 @@ def simulate_combination(
             axle_traces[key] = tuple(axle_points)
             wheel_traces[f"{key} left wheel"] = tuple(left_wheels)
             wheel_traces[f"{key} right wheel"] = tuple(right_wheels)
-        envelope_poses = poses[::envelope_pose_stride]
-        if (len(poses) - 1) % envelope_pose_stride:
-            envelope_poses.append(poses[-1])
-        polygons.extend(swept_spans(
-            _rectangle(reference, heading, unit) for reference, heading in envelope_poses
-        ))
-        # Sweep protruding couplings separately so gaps between bodies stay open.
-        for hitch in (unit.front_hitch_m, -unit.rear_hitch_m):
-            body_edge = min(unit.front_extent_m, max(-unit.rear_extent_m, hitch))
-            if hitch != body_edge:
-                polygons.extend(swept_spans(
-                    _coupling_strip(reference, heading, min(hitch, body_edge),
-                                    max(hitch, body_edge), unit.hitch_width_m)
-                    for reference, heading in envelope_poses
-                ))
+        for pose_index, (reference, heading) in enumerate(poses):
+            if pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1:
+                polygons.append(_rectangle(reference, heading, unit))
+            front_hitch = unit.front_hitch_m
+            if (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and front_hitch > unit.front_extent_m:
+                polygons.append(
+                    _coupling_strip(
+                        reference,
+                        heading,
+                        unit.front_extent_m,
+                        front_hitch,
+                        unit.hitch_width_m,
+                    )
+                )
+            rear_hitch = -unit.rear_hitch_m
+            if (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and rear_hitch < -unit.rear_extent_m:
+                polygons.append(
+                    _coupling_strip(
+                        reference,
+                        heading,
+                        rear_hitch,
+                        -unit.rear_extent_m,
+                        unit.hitch_width_m,
+                    )
+                )
+            elif (pose_index % envelope_pose_stride == 0 or pose_index == len(poses) - 1) and rear_hitch > unit.front_extent_m:
+                polygons.append(
+                    _coupling_strip(
+                        reference,
+                        heading,
+                        unit.front_extent_m,
+                        rear_hitch,
+                        unit.hitch_width_m,
+                    )
+                )
         trajectories.append(
             UnitTrajectory(
                 unit.name,
@@ -758,4 +854,5 @@ def simulate_combination(
         steering_rate_saturated,
         maximum_path_error,
         path_complete,
+        dry_steering,
     )

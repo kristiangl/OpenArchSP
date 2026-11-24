@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import datetime
 import math
+import re
 import sys
 import tempfile
 import uuid
@@ -12,13 +14,16 @@ from dataclasses import fields, replace
 from html import escape
 from urllib.parse import urlsplit
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import ezdxf
-from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, QThreadPool, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
+    QDesktopServices,
     QIcon,
     QKeySequence,
     QPainter,
@@ -49,14 +54,17 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
     QStatusBar,
     QProgressBar,
+    QPushButton,
     QStackedWidget,
     QToolButton,
     QScrollArea,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -66,10 +74,12 @@ from PySide6.QtWidgets import (
 )
 
 from openarchsp.start_screen import StartScreen
+from openarchsp.analysis import check_envelope_clearance, modelspace_layers
 from openarchsp.history import EditCommand, EditorState, PathState, undoable
 from openarchsp.drawing import make_scene, prepare_background, read_dxf
 from openarchsp.project import PathSettings, Project, SweptPathDocument, calculate_path, save_project
 from openarchsp.swept_path import polygons
+from openarchsp import __version__
 from openarchsp.standard_profiles import standard_vehicle_geometries
 from openarchsp.vehicles import (
     CUSTOM_RIGID_VEHICLE,
@@ -108,11 +118,14 @@ class DrawingView(QGraphicsView):
     positionClicked = Signal(float, float)
     worldMoved = Signal(float, float)
     finishRequested = Signal()
+    insertWaypointRequested = Signal(float, float)
+    deleteWaypointsRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.drawing_mode = False
         self.position_mode = False
+        self.insert_waypoint_mode = False
         self._pan_position = None
         self.scene = QGraphicsScene(self)
         self.drawing_bounds = None
@@ -147,6 +160,13 @@ class DrawingView(QGraphicsView):
         if self.position_mode and event.button() == Qt.MouseButton.LeftButton:
             point = self.mapToScene(event.position().toPoint())
             self.positionClicked.emit(point.x(), -point.y())
+            event.accept()
+            return
+        if self.insert_waypoint_mode and event.button() == Qt.MouseButton.LeftButton:
+            point = self.mapToScene(event.position().toPoint())
+            self.insertWaypointRequested.emit(point.x(), -point.y())
+            self.insert_waypoint_mode = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
             event.accept()
             return
         if self.drawing_mode and event.button() == Qt.MouseButton.RightButton:
@@ -186,6 +206,15 @@ class DrawingView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: object) -> None:
+        if event.key() == Qt.Key.Key_Delete:
+            self.deleteWaypointsRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.insert_waypoint_mode:
+            self.insert_waypoint_mode = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Escape and self.drawing_mode:
             self.finishRequested.emit()
             event.accept()
@@ -216,6 +245,53 @@ class _PreviewWorker(QRunnable):
             self.signals.finished.emit(self.token, payload, "")
         except Exception as error:
             self.signals.finished.emit(self.token, None, str(error))
+
+
+class _ClearanceSignals(QObject):
+    finished = Signal(object, str)
+
+
+class _ClearanceWorker(QRunnable):
+    def __init__(self, envelope, document, layers, scale):
+        super().__init__()
+        self.envelope, self.document, self.layers, self.scale = envelope, document, layers, scale
+        self.signals = _ClearanceSignals()
+
+    def run(self):
+        try:
+            self.signals.finished.emit(
+                check_envelope_clearance(self.envelope, self.document, self.layers, self.scale), ""
+            )
+        except Exception as error:
+            self.signals.finished.emit(None, str(error))
+
+
+class _UpdateSignals(QObject):
+    finished = Signal(object, str)
+
+
+class _UpdateCheckWorker(QRunnable):
+    def __init__(self):
+        super().__init__()
+        self.signals = _UpdateSignals()
+
+    def run(self):
+        request = Request(
+            "https://api.github.com/repos/kristiangl/OpenArchSP/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "OpenArch-Swept-Paths-Updater"},
+        )
+        try:
+            with urlopen(request, timeout=8) as response:
+                release = json.loads(response.read().decode("utf-8"))
+            if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+                raise ValueError("GitHub did not return a stable release.")
+            if not release.get("tag_name") or not release.get("html_url"):
+                raise ValueError("The latest release is missing its version or page URL.")
+            self.signals.finished.emit(release, "")
+        except HTTPError as error:
+            self.signals.finished.emit(None, "No published release was found yet." if error.code == 404 else str(error))
+        except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
+            self.signals.finished.emit(None, str(error))
 
 
 class _LoadSignals(QObject):
@@ -288,6 +364,7 @@ class WaypointItem(QGraphicsEllipseItem):
         self.moved_callback = moved_callback
         self.setPos(point[0], -point[1])
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setBrush(QColor(color))
@@ -682,6 +759,15 @@ class MainWindow(QMainWindow):
         self._preview_fast = True
         self.preview_pool = QThreadPool(self)
         self.preview_pool.setMaxThreadCount(1)
+        self.clearance_pool = QThreadPool(self)
+        self.clearance_pool.setMaxThreadCount(1)
+        self._clearance_pending = False
+        self._clearance_running = False
+        self._clearance_worker = None
+        self.update_pool = QThreadPool(self)
+        self.update_pool.setMaxThreadCount(1)
+        self._update_check_running = False
+        self._update_check_manual = False
         self.vehicle_geometries = self._load_vehicle_geometries()
         self._last_vehicle_geometry_mode: bool | None = None
 
@@ -698,6 +784,8 @@ class MainWindow(QMainWindow):
         self.view.positionClicked.connect(self.add_vehicle_station)
         self.view.worldMoved.connect(self.update_hover_point)
         self.view.finishRequested.connect(self.finish_route)
+        self.view.insertWaypointRequested.connect(self.insert_route_point)
+        self.view.deleteWaypointsRequested.connect(self.delete_selected_waypoints)
 
         self._build_vehicle_panel()
         self._build_display_panel()
@@ -710,16 +798,21 @@ class MainWindow(QMainWindow):
         self.speed_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.steering_limit_spin.valueChanged.connect(self._vehicle_dimensions_changed)
         self.lock_to_lock_spin.valueChanged.connect(self._vehicle_dimensions_changed)
+        self.dry_steering_check.toggled.connect(self._vehicle_dimensions_changed)
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
         self.preview_timer.setInterval(100)
         self.preview_timer.timeout.connect(self._preview_current_route)
+        self.playback_timer = QTimer(self)
+        self.playback_timer.setInterval(50)
+        self.playback_timer.timeout.connect(self._advance_playback)
 
         self.status = QStatusBar()
         self.status.showMessage("Open a DXF or DWG site drawing to begin")
         self.setStatusBar(self.status)
         self._vehicle_selected()
         self._show_start_screen()
+        QTimer.singleShot(1800, self._automatic_update_check)
 
     def _show_start_screen(self):
         if self.pages.currentWidget() == self.view:
@@ -755,6 +848,74 @@ class MainWindow(QMainWindow):
     @property
     def active_path(self) -> SweptPathDocument:
         return next(path for path in self.swept_paths if path.id == self.active_path_id)
+
+    @staticmethod
+    def _version_key(value: str):
+        match = re.fullmatch(
+            r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", value.strip()
+        )
+        if not match:
+            return None
+        major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+        prerelease = match.group(4) or ""
+        return major, minor, patch, 0 if prerelease else 1, prerelease
+
+    def _automatic_update_check(self) -> None:
+        if QSettings("OpenArch", "OpenArchSweptPaths").value("checkForUpdatesAutomatically", True, type=bool):
+            self.check_for_updates(manual=False)
+
+    def check_for_updates(self, *, manual: bool = True) -> None:
+        if self._update_check_running:
+            self._update_check_manual |= manual
+            return
+        self._update_check_running = True
+        self._update_check_manual = manual
+        self.update_action.setEnabled(False)
+        worker = _UpdateCheckWorker()
+        worker.signals.finished.connect(self._update_check_finished)
+        self._update_worker = worker
+        self.update_pool.start(worker)
+
+    def _update_check_finished(self, release, error: str) -> None:
+        self._update_check_running = False
+        self.update_action.setEnabled(True)
+        manual = self._update_check_manual
+        self._update_check_manual = False
+        self._update_worker = None
+        if error or not isinstance(release, dict):
+            if manual:
+                QMessageBox.warning(self, "Update check failed", error or "The release response was invalid.")
+            return
+        tag = str(release.get("tag_name", ""))
+        latest, current = self._version_key(tag), self._version_key(__version__)
+        if latest is None or current is None:
+            if manual:
+                QMessageBox.warning(self, "Update check failed", "Could not compare the release version.")
+            return
+        if latest <= current:
+            if manual:
+                QMessageBox.information(self, "No updates available", f"OpenArch Swept Paths {__version__} is current.")
+            return
+        settings = QSettings("OpenArch", "OpenArchSweptPaths")
+        if not manual and settings.value("lastNotifiedRelease", "") == tag:
+            return
+        settings.setValue("lastNotifiedRelease", tag)
+        url = str(release.get("html_url", ""))
+        if not url.startswith("https://github.com/kristiangl/OpenArchSP/releases/"):
+            url = "https://github.com/kristiangl/OpenArchSP/releases/latest"
+        message = QMessageBox(self)
+        message.setWindowTitle("OpenArch Swept Paths update available")
+        message.setText(f"Version {tag.removeprefix('v')} is available. You are using {__version__}.")
+        message.setInformativeText("Open the release page to download the installer for this computer.")
+        message.setDetailedText(str(release.get("body") or "No release notes were provided.")[:5000])
+        open_button = message.addButton("Open release page", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() == open_button:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _automatic_updates_toggled(self, enabled: bool) -> None:
+        QSettings("OpenArch", "OpenArchSweptPaths").setValue("checkForUpdatesAutomatically", enabled)
 
     @property
     def route_points(self) -> list[tuple[float, float]]:
@@ -839,12 +1000,15 @@ class MainWindow(QMainWindow):
             self.vehicle_combo.setCurrentIndex(vehicle_index)
         self._vehicle_selected()
         self._apply_settings(self.active_path.settings)
+        self._sync_direction_action()
         self._path_switching = False
         self._refresh_vehicle_station_list()
         self._render_route()
         self._render_other_paths()
         if self.active_path.simulation_result and self.active_path.envelope_geometry is not None:
             self.simulation_result = self.active_path.simulation_result
+            self.playback_slider.setEnabled(True)
+            self.playback_slider.setValue(0)
             self.envelope_geometry = self.active_path.envelope_geometry
             self.simulation_scale = self.active_path.simulation_scale
             self._render_envelope(self.envelope_geometry)
@@ -859,6 +1023,7 @@ class MainWindow(QMainWindow):
                 self.simulation_scale,
             )
         elif self.active_path.envelope_geometry is not None:
+            self.playback_slider.setEnabled(False)
             self.envelope_geometry = self.active_path.envelope_geometry
             self._render_envelope(self.envelope_geometry)
         elif len(self.route_points) >= 2 and self.document is not None:
@@ -933,6 +1098,13 @@ class MainWindow(QMainWindow):
             "Radius used to round path waypoints into tangential turns."
         )
         form.addRow("Waypoint turn radius (m)", self.corner_radius_spin)
+        self.minimum_radius_button = QPushButton("Use minimum steer-axle radius")
+        self.minimum_radius_button.setToolTip(
+            "Uses the lead vehicle's bicycle-model wheelbase and steering limit. "
+            "Articulated trailer limits still need checking."
+        )
+        self.minimum_radius_button.clicked.connect(self._use_minimum_turn_radius)
+        form.addRow(self.minimum_radius_button)
         self.speed_spin = self._dimension_spin(100.0, 5.0)
         form.addRow("Travel speed (km/h)", self.speed_spin)
         self.steering_limit_spin = self._dimension_spin(60.0, 35.0)
@@ -946,6 +1118,12 @@ class MainWindow(QMainWindow):
             "Time for the road wheels to move from full lock one way to full lock the other."
         )
         form.addRow("Steering lock-to-lock (s)", self.lock_to_lock_spin)
+        self.dry_steering_check = QCheckBox("Allow dry steering")
+        self.dry_steering_check.setToolTip(
+            "Allows steering adjustment while stopped and removes lock-to-lock timing "
+            "from the spatial solution. Stop duration and position are not modelled."
+        )
+        form.addRow(self.dry_steering_check)
 
         form.addRow("Drawing units per metre", self.units_spin)
         section_title("Profile details")
@@ -1026,6 +1204,31 @@ class MainWindow(QMainWindow):
         station_buttons.addWidget(self.add_station_button)
         station_buttons.addWidget(self.remove_station_button)
         layout.addLayout(station_buttons)
+        playback_row = QHBoxLayout()
+        self.playback_button = QPushButton("Play route", panel)
+        self.playback_button.clicked.connect(self._toggle_playback)
+        self.playback_slider = QSlider(Qt.Orientation.Horizontal, panel)
+        self.playback_slider.setRange(0, 1000)
+        self.playback_slider.setEnabled(False)
+        self.playback_slider.valueChanged.connect(self._playback_slider_changed)
+        playback_row.addWidget(self.playback_button)
+        playback_row.addWidget(self.playback_slider, 1)
+        layout.addLayout(playback_row)
+        layout.addWidget(QLabel("Site layers for clearance check", panel))
+        self.clearance_layer_list = QListWidget(panel)
+        self.clearance_layer_list.setMaximumHeight(120)
+        layout.addWidget(self.clearance_layer_list)
+        clearance_buttons = QHBoxLayout()
+        self.select_clearance_layers_button = QPushButton("Select all", panel)
+        self.select_clearance_layers_button.clicked.connect(self._toggle_clearance_layers)
+        self.check_clearance_button = QPushButton("Check clearance", panel)
+        self.check_clearance_button.clicked.connect(self.check_clearance)
+        clearance_buttons.addWidget(self.select_clearance_layers_button)
+        clearance_buttons.addWidget(self.check_clearance_button)
+        layout.addLayout(clearance_buttons)
+        self.clearance_status_label = QLabel("No clearance check has been run", panel)
+        self.clearance_status_label.setWordWrap(True)
+        layout.addWidget(self.clearance_status_label)
         layout.addStretch(1)
         dock.setWidget(panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -1065,6 +1268,35 @@ class MainWindow(QMainWindow):
                 self.simulation_result,
                 self.vehicle_geometries[self.active_path.vehicle_id],
                 self.simulation_scale,
+            )
+
+    def _toggle_playback(self) -> None:
+        if self.simulation_result is None:
+            self.status.showMessage("Calculate a vehicle path before playback")
+        elif self.playback_timer.isActive():
+            self.playback_timer.stop()
+            self.playback_button.setText("Play route")
+        else:
+            if self.playback_slider.value() >= self.playback_slider.maximum():
+                self.playback_slider.setValue(0)
+            self.playback_button.setText("Pause")
+            self.playback_timer.start()
+
+    def _advance_playback(self) -> None:
+        value = self.playback_slider.value() + 5
+        if value >= self.playback_slider.maximum():
+            value = self.playback_slider.maximum()
+            self.playback_timer.stop()
+            self.playback_button.setText("Play route")
+        self.playback_slider.setValue(value)
+
+    def _playback_slider_changed(self, value: int) -> None:
+        if self.simulation_result is not None:
+            self._render_travel_positions(
+                self.simulation_result,
+                self.vehicle_geometries[self.active_path.vehicle_id],
+                self.simulation_scale,
+                playback_fraction=value / self.playback_slider.maximum(),
             )
 
     def _begin_vehicle_station_mode(self) -> None:
@@ -1138,6 +1370,75 @@ class MainWindow(QMainWindow):
         for fraction in self.active_path.vehicle_stations:
             self.vehicle_station_list.addItem(f"{fraction * 100:.1f}% along route")
 
+    def _populate_clearance_layers(self) -> None:
+        self.clearance_layer_list.clear()
+        if self.document is not None:
+            for layer in modelspace_layers(self.document):
+                item = QListWidgetItem(layer, self.clearance_layer_list)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _toggle_clearance_layers(self) -> None:
+        items = [self.clearance_layer_list.item(i) for i in range(self.clearance_layer_list.count())]
+        checked = bool(items) and all(item.checkState() == Qt.CheckState.Checked for item in items)
+        state = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+        for item in items:
+            item.setCheckState(state)
+        self.select_clearance_layers_button.setText("Select all" if checked else "Clear selection")
+
+    def check_clearance(self) -> None:
+        selected = any(
+            self.clearance_layer_list.item(i).checkState() == Qt.CheckState.Checked
+            for i in range(self.clearance_layer_list.count())
+        )
+        if self.document is None or len(self.route_points) < 2:
+            self.clearance_status_label.setText("Open a drawing and define a path first.")
+        elif not selected:
+            self.clearance_status_label.setText("Select one or more site layers to check.")
+        elif self.envelope_geometry is None:
+            self._clearance_pending = True
+            self.clearance_status_label.setText("Calculating swept envelope before clearance check…")
+            self.calculate_envelope(show_errors=False)
+        else:
+            self._run_clearance_check()
+
+    def _run_clearance_check(self) -> None:
+        if self._clearance_running or self.document is None or self.envelope_geometry is None:
+            return
+        selected = [
+            self.clearance_layer_list.item(i).text()
+            for i in range(self.clearance_layer_list.count())
+            if self.clearance_layer_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        self._clearance_pending = False
+        if not selected:
+            return
+        self._clearance_running = True
+        self.check_clearance_button.setEnabled(False)
+        self.clearance_status_label.setText("Checking selected site layers…")
+        worker = _ClearanceWorker(self.envelope_geometry, self.document, selected, self.units_spin.value())
+        worker.signals.finished.connect(self._clearance_completed)
+        self._clearance_worker = worker
+        self.clearance_pool.start(worker)
+
+    def _clearance_completed(self, summary, error: str) -> None:
+        self._clearance_running = False
+        self._clearance_worker = None
+        self.check_clearance_button.setEnabled(True)
+        if error or not isinstance(summary, dict):
+            self.clearance_status_label.setText(f"Clearance check failed: {error or 'invalid result'}")
+            return
+        collisions, minimum = summary["collision_layers"], summary["minimum_clearance_m"]
+        if collisions:
+            text = "Envelope intersects: " + ", ".join(collisions)
+        elif minimum is None:
+            text = "No supported geometry was found on selected layers."
+        else:
+            closest = min(summary["per_layer"].items(), key=lambda pair: pair[1]["clearance_m"])[0]
+            text = f"Minimum clearance: {minimum:.2f} m to {closest}"
+        self.active_path.clearance_summary = summary
+        self.clearance_status_label.setText(text)
+
     @staticmethod
     def _dimension_spin(maximum: float, value: float) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
@@ -1176,6 +1477,9 @@ class MainWindow(QMainWindow):
         self.save_copy_action.triggered.connect(self.save_drawing_copy)
         self.save_copy_action.setEnabled(False)
         file_menu.addAction(self.save_copy_action)
+        self.report_action = QAction("Export path analysis report…", self)
+        self.report_action.triggered.connect(self.export_analysis_report)
+        file_menu.addAction(self.report_action)
 
         view_menu = self.menuBar().addMenu("&View")
         fit_action = QAction("Zoom to &Extents", self)
@@ -1215,6 +1519,8 @@ class MainWindow(QMainWindow):
         remove_path_action.triggered.connect(self.remove_swept_path)
         toolbar.addAction(remove_path_action)
         toolbar.addSeparator()
+        toolbar.addAction(self.reverse_action)
+        toolbar.addSeparator()
 
         self.draw_action = QAction("Draw reference path", self)
         self.draw_action.setIcon(action_icon("draw-path"))
@@ -1252,6 +1558,13 @@ class MainWindow(QMainWindow):
         clear_action.setIcon(action_icon("clear-path"))
         clear_action.triggered.connect(self.clear_route)
         toolbar.addAction(clear_action)
+        insert_action = QAction("Insert waypoint", self)
+        insert_action.triggered.connect(self.arm_waypoint_insert)
+        toolbar.addAction(insert_action)
+        delete_waypoints_action = QAction("Delete selected waypoints", self)
+        delete_waypoints_action.setShortcut(QKeySequence.StandardKey.Delete)
+        delete_waypoints_action.triggered.connect(self.delete_selected_waypoints)
+        toolbar.addAction(delete_waypoints_action)
 
         self.calculate_action.setIconText("Calculate")
         self.export_action.setIconText("Paths DXF")
@@ -1281,7 +1594,22 @@ class MainWindow(QMainWindow):
             ):
                 toolbar.removeAction(action)
 
+        vehicle_menu = self.menuBar().addMenu("&Vehicle")
+        self.reverse_action = QAction("Direction: Forward", self)
+        self.reverse_action.setCheckable(True)
+        self.reverse_action.setToolTip("Toggle forward and reverse travel for this path")
+        self.reverse_action.toggled.connect(self._direction_toggled)
+        vehicle_menu.addAction(self.reverse_action)
         help_menu = self.menuBar().addMenu("&Help")
+        self.update_action = help_menu.addAction("Check for Updates…")
+        self.update_action.triggered.connect(lambda: self.check_for_updates(manual=True))
+        self.auto_update_action = QAction("Automatically check for updates", self)
+        self.auto_update_action.setCheckable(True)
+        self.auto_update_action.setChecked(
+            QSettings("OpenArch", "OpenArchSweptPaths").value("checkForUpdatesAutomatically", True, type=bool)
+        )
+        self.auto_update_action.toggled.connect(self._automatic_updates_toggled)
+        help_menu.addAction(self.auto_update_action)
         start_action = help_menu.addAction("Getting started")
         start_action.triggered.connect(self._show_start_screen)
 
@@ -1326,6 +1654,7 @@ class MainWindow(QMainWindow):
         self._background_file = Path(new_tempdir.name) / "background.dxf"
         self.document = document
         self.drawing_path = path
+        self._populate_clearance_layers()
         self.project_path = path if project else None
         self.view.drawing_bounds = drawing_bounds
         margin = max(drawing_bounds.width(), drawing_bounds.height(), 1000.0) * 20
@@ -1375,6 +1704,12 @@ class MainWindow(QMainWindow):
                 checkbox.blockSignals(True)
                 checkbox.setChecked(project.display.get(key, True))
                 checkbox.blockSignals(False)
+            saved_layers = set(project.clearance_layers)
+            for i in range(self.clearance_layer_list.count()):
+                item = self.clearance_layer_list.item(i)
+                item.setCheckState(
+                    Qt.CheckState.Checked if item.text() in saved_layers else Qt.CheckState.Unchecked
+                )
         self.active_path_id = ""
         self._path_selection_changed(self.path_combo.currentIndex())
         self.draw_action.setEnabled(True)
@@ -1503,7 +1838,9 @@ class MainWindow(QMainWindow):
         self.active_path.settings = self._settings()
         project = Project(self.swept_paths, self.active_path_id, self.units_spin.value(),
                           self.vehicle_definitions, self.vehicle_geometries,
-                          {k: c.isChecked() for k, c in self._display_controls().items()})
+                          {k: c.isChecked() for k, c in self._display_controls().items()},
+                          [self.clearance_layer_list.item(i).text() for i in range(self.clearance_layer_list.count())
+                           if self.clearance_layer_list.item(i).checkState() == Qt.CheckState.Checked])
         try:
             save_project(target, self._background_file, project)
         except Exception as error:
@@ -1539,6 +1876,7 @@ class MainWindow(QMainWindow):
         if not self._path_switching:
             self.active_path.vehicle_id = vehicle.id
         has_geometry = vehicle.id in self.vehicle_geometries
+        self.minimum_radius_button.setEnabled(has_geometry)
         if (
             not self._path_switching
             and self._last_vehicle_geometry_mode is not None
@@ -1602,6 +1940,7 @@ class MainWindow(QMainWindow):
         if self._path_switching:
             return
         self.active_path.settings = self._settings()
+        self.active_path.clearance_summary = None
         self._clear_envelope()
         self._render_other_paths()
         self._update_export_state()
@@ -1618,13 +1957,49 @@ class MainWindow(QMainWindow):
 
     def _settings(self) -> PathSettings:
         return PathSettings(**{
-            field.name: getattr(self, field.name + "_spin").value() for field in fields(PathSettings)
+            field.name: (
+                self.dry_steering_check.isChecked() if field.name == "dry_steering"
+                else self.reverse_action.isChecked() if field.name == "reverse"
+                else getattr(self, field.name + "_spin").value()
+            ) for field in fields(PathSettings)
         })
 
     def _apply_settings(self, settings):
         if settings is not None:
             for field in fields(settings):
-                getattr(self, field.name + "_spin").setValue(getattr(settings, field.name))
+                if field.name == "dry_steering":
+                    self.dry_steering_check.setChecked(settings.dry_steering)
+                elif field.name == "reverse":
+                    self.reverse_action.setChecked(settings.reverse)
+                else:
+                    getattr(self, field.name + "_spin").setValue(getattr(settings, field.name))
+
+    def _sync_direction_action(self) -> None:
+        self.reverse_action.blockSignals(True)
+        reverse = bool(self.active_path.settings and self.active_path.settings.reverse)
+        self.reverse_action.setChecked(reverse)
+        self.reverse_action.setText("Direction: Reverse" if reverse else "Direction: Forward")
+        self.reverse_action.blockSignals(False)
+
+    @undoable("Change travel direction")
+    def _direction_toggled(self, reverse: bool) -> None:
+        self.reverse_action.setText("Direction: Reverse" if reverse else "Direction: Forward")
+        if self._path_switching:
+            return
+        self.active_path.settings = replace(self._settings(), reverse=reverse)
+        self._vehicle_dimensions_changed()
+
+    @undoable("Use minimum turn radius")
+    def _use_minimum_turn_radius(self) -> None:
+        geometry = self.vehicle_geometries.get(self._selected_vehicle().id)
+        angle = math.radians(self.steering_limit_spin.value())
+        if geometry is None or angle <= 0:
+            self.status.showMessage("Minimum radius needs axle geometry and a positive steering angle")
+            return
+        radius = geometry.steer_axle_m / math.tan(angle)
+        self.dry_steering_check.setChecked(True)
+        self.corner_radius_spin.setValue(min(100.0, max(0.1, radius)))
+        self.status.showMessage(f"Dry steering enabled · waypoint radius set to {radius:.2f} m")
 
     def _queue_live_preview(self) -> None:
         self._preview_generation += 1
@@ -1760,10 +2135,63 @@ class MainWindow(QMainWindow):
         if self.route_points and math.dist(self.route_points[-1], (scene_x, scene_y)) < 1e-6:
             return
         self.route_points.append((scene_x, scene_y))
+        self.active_path.clearance_summary = None
         self._clear_envelope()
         self._render_route()
         self._update_export_state()
         self.status.showMessage(f"{self._route_label()}: {len(self.route_points)} points")
+        self._queue_live_preview()
+
+    def arm_waypoint_insert(self) -> None:
+        if self.view.drawing_mode or self.view.position_mode:
+            self.status.showMessage("Finish the current drawing or position tool before inserting a waypoint")
+            return
+        if len(self.route_points) < 2:
+            self.status.showMessage("Define a route before inserting a waypoint")
+            return
+        self.view.insert_waypoint_mode = True
+        self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.status.showMessage("Click a route segment to insert a waypoint · Esc to cancel")
+
+    @undoable("Insert waypoint")
+    def insert_route_point(self, x: float, y: float) -> None:
+        points = self.route_points
+        if len(points) < 2:
+            return
+        best_index, best_distance = 1, float("inf")
+        for index, (start, end) in enumerate(zip(points, points[1:]), start=1):
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length_squared = dx * dx + dy * dy
+            fraction = 0.0 if length_squared <= 1e-15 else max(
+                0.0, min(1.0, ((x - start[0]) * dx + (y - start[1]) * dy) / length_squared)
+            )
+            projected = (start[0] + fraction * dx, start[1] + fraction * dy)
+            distance = (x - projected[0]) ** 2 + (y - projected[1]) ** 2
+            if distance < best_distance:
+                best_index, best_distance = index, distance
+        self.route_points.insert(best_index, (x, y))
+        self.active_path.clearance_summary = None
+        self._clear_envelope()
+        self._render_route()
+        self._queue_live_preview()
+
+    @undoable("Delete waypoints")
+    def delete_selected_waypoints(self) -> None:
+        selected = {
+            item.index for item in self.view.scene.selectedItems()
+            if isinstance(item, WaypointItem)
+        }
+        if not selected:
+            return
+        if len(self.route_points) - len(selected) < 2:
+            self.status.showMessage("A route must retain at least two waypoints")
+            return
+        self.route_points[:] = [
+            point for index, point in enumerate(self.route_points) if index not in selected
+        ]
+        self.active_path.clearance_summary = None
+        self._clear_envelope()
+        self._render_route()
         self._queue_live_preview()
 
     def finish_route(self) -> None:
@@ -1790,6 +2218,7 @@ class MainWindow(QMainWindow):
         if not self.route_points:
             return
         self.route_points.pop()
+        self.active_path.clearance_summary = None
         self._clear_envelope()
         self._render_route()
         self._update_export_state()
@@ -1803,6 +2232,7 @@ class MainWindow(QMainWindow):
         self._hover_point = None
         self._render_hover_cursor()
         self.route_points.clear()
+        self.active_path.clearance_summary = None
         self.active_path.vehicle_stations.clear()
         self._refresh_vehicle_station_list()
         self._clear_envelope()
@@ -1815,6 +2245,10 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Reference path cleared")
 
     def _clear_envelope(self, *, clear_record: bool = True) -> None:
+        self.playback_timer.stop()
+        if hasattr(self, "playback_button"):
+            self.playback_button.setText("Play route")
+            self.playback_slider.setEnabled(False)
         for item in self.trace_items:
             self.view.scene.removeItem(item)
         self.trace_items.clear()
@@ -1869,6 +2303,7 @@ class MainWindow(QMainWindow):
         if not 0 <= index < len(self.route_points):
             return
         self.route_points[index] = (x, y)
+        self.active_path.clearance_summary = None
         self._clear_envelope()
         if live:
             self._render_route_line()
@@ -2040,6 +2475,7 @@ class MainWindow(QMainWindow):
             return
 
         if error:
+            self._clearance_pending = False
             self._clear_envelope()
             self._preview_validity = "invalid"
             self._render_hover_cursor()
@@ -2056,6 +2492,7 @@ class MainWindow(QMainWindow):
             self._render_envelope(envelope)
             if result is None:
                 self.simulation_result = None
+                self.playback_slider.setEnabled(False)
                 vehicle = self._selected_vehicle()
                 self.status.showMessage(
                     f"Rigid-body footprint preview · {vehicle.name} · "
@@ -2064,6 +2501,8 @@ class MainWindow(QMainWindow):
                 self._preview_validity = "valid"
             else:
                 self.simulation_result = result
+                self.playback_slider.setEnabled(True)
+                self.playback_slider.setValue(0)
                 self.simulation_scale = self.units_spin.value()
                 geometry = self.vehicle_geometries[self._selected_vehicle().id]
                 self._render_simulation_traces(result, geometry, self.simulation_scale)
@@ -2084,13 +2523,16 @@ class MainWindow(QMainWindow):
                 state = "" if reachable else " · candidate exceeds steering/path limits"
                 self.status.showMessage(
                     f"{'Fast live preview' if self._preview_fast else 'Detailed preview'} · {geometry.name} · "
+                    f"{'Reverse' if self.active_path.settings and self.active_path.settings.reverse else 'Forward'} · "
                     f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
                     f"axle off-tracking {max_offtracking:.2f} m · "
                     f"articulation {result.maximum_articulation_deg:.1f}° · "
-                    f"steering rate {result.max_steering_rate_deg_s:.1f}°/s · "
+                    f"{'dry steering' if result.dry_steering else f'steering rate {result.max_steering_rate_deg_s:.1f}°/s'} · "
                     f"target path error {result.maximum_path_error_m:.2f} m{state}"
                 )
             self._render_hover_cursor()
+            if self._clearance_pending:
+                self._run_clearance_check()
 
         if token != self._preview_generation and len(self._current_preview_route()) >= 2:
             self.preview_timer.start(0)
@@ -2177,7 +2619,8 @@ class MainWindow(QMainWindow):
         self._render_travel_positions(result, geometry, scale)
 
     def _render_travel_positions(
-        self, result: SimulationResult, geometry: CombinationGeometry, scale: float
+        self, result: SimulationResult, geometry: CombinationGeometry, scale: float,
+        *, playback_fraction: float | None = None,
     ) -> None:
         for item in self.position_items:
             self.view.scene.removeItem(item)
@@ -2195,6 +2638,8 @@ class MainWindow(QMainWindow):
             positions.append((last_index, "End"))
         for station_index, fraction in enumerate(self.active_path.vehicle_stations, start=1):
             positions.append((round(fraction * last_index), f"Position {station_index}"))
+        if playback_fraction is not None:
+            positions.append((round(playback_fraction * last_index), "Playback"))
 
         colors = ("#f2f4f5", "#c9d0d5", "#aeb7be", "#e3e7eb")
         vehicle_name = self.vehicle_definitions[self.active_path.vehicle_id].name
@@ -2674,6 +3119,65 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not save drawing copy", str(error))
             return
         self.status.showMessage(f"Saved drawing copy with swept paths to {target}")
+
+    def export_analysis_report(self) -> None:
+        if self.document is None or not self.swept_paths:
+            QMessageBox.information(self, "Export analysis report", "Open a drawing and define a path first.")
+            return
+        source = self.project_path or self.drawing_path or Path.cwd()
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Export path analysis report", str(source.with_suffix(".html")), "HTML report (*.html)"
+        )
+        if not target:
+            return
+        sections = []
+        for path in self.swept_paths:
+            vehicle = self.vehicle_definitions.get(path.vehicle_id)
+            result = path.simulation_result
+            details = [
+                f"<b>Vehicle:</b> {escape(vehicle.name if vehicle else path.vehicle_id)}",
+                f"<b>Direction:</b> {'Reverse' if path.settings and path.settings.reverse else 'Forward'}",
+                f"<b>Waypoints:</b> {len(path.points)}",
+                f"<b>Route stations:</b> {len(path.vehicle_stations)}",
+                f"<b>Dry steering:</b> {'Allowed' if path.settings and path.settings.dry_steering else 'Not allowed'}",
+            ]
+            if result:
+                details.extend([
+                    f"<b>Tracked distance:</b> {result.path_length_m:.2f} m",
+                    f"<b>Maximum articulation:</b> {result.maximum_articulation_deg:.1f}°",
+                    f"<b>Maximum axle off-tracking:</b> {max(result.offtracking_by_axle_m.values(), default=0.0):.2f} m",
+                    f"<b>Maximum steering angle:</b> {max((abs(a) for a in result.steering_angles_deg), default=0.0):.1f}°",
+                    f"<b>Completed:</b> {'Yes' if result.path_complete else 'No'}",
+                    f"<b>Steering rate saturated:</b> {'Yes' if result.steering_rate_saturated else 'No'}",
+                    f"<b>Maximum tracking error:</b> {result.maximum_path_error_m:.2f} m",
+                ])
+            else:
+                details.append("<b>Simulation:</b> No calculated result")
+            clearance = getattr(path, "clearance_summary", None)
+            if clearance:
+                collision_names = ", ".join(escape(str(name)) for name in clearance.get("collision_layers", []))
+                minimum = clearance.get("minimum_clearance_m")
+                details.append(
+                    f"<b>Clearance:</b> {('Intersection with ' + collision_names) if collision_names else (f'{minimum:.2f} m minimum' if minimum is not None else 'No supported geometry found')}"
+                )
+            else:
+                details.append("<b>Clearance:</b> Not checked")
+            sections.append(f"<section><h2>{escape(path.name)}</h2><p>{'<br>'.join(details)}</p></section>")
+        generated = escape(datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z"))
+        drawing = escape(self.drawing_path.name if self.drawing_path else "Drawing")
+        content = (
+            "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+            "<title>OpenArch Swept Paths Analysis</title><style>body{font:15px Segoe UI,Arial;background:#1b1d20;color:#e7eaed;max-width:900px;margin:40px auto;padding:0 24px}h1,h2{color:#8ecb91}section{border:1px solid #42484e;border-radius:8px;padding:8px 20px;margin:18px 0}p{line-height:1.8}</style>"
+            f"<h1>OpenArch Swept Paths · Analysis</h1><p><b>Base drawing:</b> {drawing}<br><b>Generated:</b> {generated}</p>"
+            + "".join(sections)
+            + "<small>Clearance checks cover supported CAD entities on selected layers. Verify vehicle assumptions and source geometry before design decisions.</small>"
+        )
+        try:
+            Path(target).write_text(content, encoding="utf-8")
+        except OSError as error:
+            QMessageBox.critical(self, "Could not export report", str(error))
+            return
+        self.status.showMessage(f"Exported analysis report to {target}")
 
     def closeEvent(self, event: object) -> None:
         if not self._confirm_replace():
