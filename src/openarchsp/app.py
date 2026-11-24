@@ -28,6 +28,8 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPolygonF,
+    QPointF,
     QFont,
     QPen,
     QUndoStack,
@@ -46,6 +48,7 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
+    QGraphicsPolygonItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
@@ -233,10 +236,10 @@ class _PreviewSignals(QObject):
 class _PreviewWorker(QRunnable):
     """Calculate one drawing preview without blocking mouse interaction."""
 
-    def __init__(self, token, route, geometry, settings, units, fast):
+    def __init__(self, token, route, geometry, settings, units, fast, reverse_segments=None):
         super().__init__()
         self.token = token
-        self.arguments = route, geometry, settings, units, fast
+        self.arguments = route, geometry, settings, units, fast, reverse_segments
         self.signals = _PreviewSignals()
 
     def run(self) -> None:
@@ -1492,9 +1495,10 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.display_dock.toggleViewAction())
 
         vehicle_menu = self.menuBar().addMenu("&Vehicle")
-        self.reverse_action = QAction("Direction: Forward", self)
+        self.reverse_action = QAction("Next segment: Forward", self)
         self.reverse_action.setCheckable(True)
-        self.reverse_action.setToolTip("Toggle forward and reverse travel for this path")
+        self.reverse_action.setIcon(action_icon("direction-forward"))
+        self.reverse_action.setToolTip("Choose the travel direction for the next route segment")
         self.reverse_action.toggled.connect(self._direction_toggled)
         vehicle_menu.addAction(self.reverse_action)
 
@@ -1730,6 +1734,7 @@ class MainWindow(QMainWindow):
         return EditorState(
             tuple(PathState(
                 p.id, p.name, p.vehicle_id, p.color, tuple(p.points),
+                tuple(p.reverse_segments),
                 tuple(p.vehicle_stations),
                 self._settings() if p.id == self.active_path_id else p.settings
             ) for p in self.swept_paths),
@@ -1771,6 +1776,7 @@ class MainWindow(QMainWindow):
             checkbox.blockSignals(False)
         self.swept_paths = [
             SweptPathDocument(p.id, p.name, p.vehicle_id, p.color, list(p.points),
+                              reverse_segments=list(p.reverse_segments),
                               simulation_scale=state.units, vehicle_stations=list(p.stations),
                               settings=p.settings) for p in state.paths
         ]
@@ -1778,6 +1784,7 @@ class MainWindow(QMainWindow):
             previous = previous_paths.get(restored.id)
             if (previous is not None and previous_units == state.units
                     and previous.points == restored.points
+                    and previous.reverse_segments == restored.reverse_segments
                     and previous.settings == restored.settings
                     and previous.vehicle_id == restored.vehicle_id
                     and previous_geometry.get(previous.vehicle_id) == state.geometries.get(restored.vehicle_id)):
@@ -1811,7 +1818,7 @@ class MainWindow(QMainWindow):
     def _edit_state(self):
         active = self._settings()
         return (self.units_spin.value(), tuple(
-            (p.id, p.name, p.vehicle_id, p.color, tuple(p.points), tuple(p.vehicle_stations),
+            (p.id, p.name, p.vehicle_id, p.color, tuple(p.points), tuple(p.reverse_segments), tuple(p.vehicle_stations),
              active if p.id == self.active_path_id else p.settings,
              self.vehicle_geometries.get(p.vehicle_id)) for p in self.swept_paths
         ), tuple(c.isChecked() for c in self._display_controls().values()))
@@ -1979,16 +1986,19 @@ class MainWindow(QMainWindow):
         self.reverse_action.blockSignals(True)
         reverse = bool(self.active_path.settings and self.active_path.settings.reverse)
         self.reverse_action.setChecked(reverse)
-        self.reverse_action.setText("Direction: Reverse" if reverse else "Direction: Forward")
+        self.reverse_action.setText("Next segment: Reverse" if reverse else "Next segment: Forward")
+        self.reverse_action.setIcon(action_icon("direction-reverse" if reverse else "direction-forward"))
         self.reverse_action.blockSignals(False)
 
     @undoable("Change travel direction")
     def _direction_toggled(self, reverse: bool) -> None:
-        self.reverse_action.setText("Direction: Reverse" if reverse else "Direction: Forward")
+        self.reverse_action.setText("Next segment: Reverse" if reverse else "Next segment: Forward")
+        self.reverse_action.setIcon(action_icon("direction-reverse" if reverse else "direction-forward"))
         if self._path_switching:
             return
         self.active_path.settings = replace(self._settings(), reverse=reverse)
-        self._vehicle_dimensions_changed()
+        self._queue_live_preview()
+        self.status.showMessage(f"Next route segment will be {'reverse' if reverse else 'forward'}")
 
     @undoable("Use minimum turn radius")
     def _use_minimum_turn_radius(self) -> None:
@@ -2117,7 +2127,7 @@ class MainWindow(QMainWindow):
             )
             self.status.showMessage(
                 f"Move the cursor to preview the next {path_name} point, then click to add it · "
-                "Esc, double-click or Finish path to finish"
+                "Direction sets the gear for the next segment · Esc, double-click or Finish path to finish"
             )
         else:
             self._preview_generation += 1
@@ -2135,6 +2145,10 @@ class MainWindow(QMainWindow):
         self._render_hover_cursor()
         if self.route_points and math.dist(self.route_points[-1], (scene_x, scene_y)) < 1e-6:
             return
+        if self.route_points:
+            self.active_path.reverse_segments.append(
+                bool(self.active_path.settings and self.active_path.settings.reverse)
+            )
         self.route_points.append((scene_x, scene_y))
         self.active_path.clearance_summary = None
         self._clear_envelope()
@@ -2171,6 +2185,10 @@ class MainWindow(QMainWindow):
             if distance < best_distance:
                 best_index, best_distance = index, distance
         self.route_points.insert(best_index, (x, y))
+        direction = (self.active_path.reverse_segments[best_index - 1]
+                     if best_index - 1 < len(self.active_path.reverse_segments)
+                     else bool(self.active_path.settings and self.active_path.settings.reverse))
+        self.active_path.reverse_segments.insert(best_index - 1, direction)
         self.active_path.clearance_summary = None
         self._clear_envelope()
         self._render_route()
@@ -2187,8 +2205,12 @@ class MainWindow(QMainWindow):
         if len(self.route_points) - len(selected) < 2:
             self.status.showMessage("A route must retain at least two waypoints")
             return
-        self.route_points[:] = [
-            point for index, point in enumerate(self.route_points) if index not in selected
+        retained = [index for index in range(len(self.route_points)) if index not in selected]
+        old_directions = list(self.active_path.reverse_segments)
+        self.route_points[:] = [self.route_points[index] for index in retained]
+        self.active_path.reverse_segments[:] = [
+            old_directions[start] if start < len(old_directions) else False
+            for start, _end in zip(retained, retained[1:])
         ]
         self.active_path.clearance_summary = None
         self._clear_envelope()
@@ -2219,6 +2241,8 @@ class MainWindow(QMainWindow):
         if not self.route_points:
             return
         self.route_points.pop()
+        if self.active_path.reverse_segments:
+            self.active_path.reverse_segments.pop()
         self.active_path.clearance_summary = None
         self._clear_envelope()
         self._render_route()
@@ -2233,6 +2257,7 @@ class MainWindow(QMainWindow):
         self._hover_point = None
         self._render_hover_cursor()
         self.route_points.clear()
+        self.active_path.reverse_segments.clear()
         self.active_path.clearance_summary = None
         self.active_path.vehicle_stations.clear()
         self._refresh_vehicle_station_list()
@@ -2299,6 +2324,33 @@ class MainWindow(QMainWindow):
         self.view.scene.addItem(line_item)
         self.route_items.append(line_item)
         self.route_line_item = line_item
+        for index, (start, end) in enumerate(zip(self.route_points, self.route_points[1:])):
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if length <= 1e-9:
+                continue
+            reverse = index < len(self.active_path.reverse_segments) and self.active_path.reverse_segments[index]
+            # Gear arrows sit at each leg midpoint; the reverse arrow points
+            # opposite the chronological route direction.
+            sign = 1.0
+            ux, uy = sign * dx / length, -sign * dy / length
+            nx, ny = -uy, ux
+            size = min(length * 0.16, max(0.35, length * 0.035))
+            mx, my = (start[0] + end[0]) / 2, -(start[1] + end[1]) / 2
+            triangle = QPolygonF([
+                QPointF(mx + ux * size, my + uy * size),
+                QPointF(mx - ux * size * 0.6 + nx * size * 0.55,
+                        my - uy * size * 0.6 + ny * size * 0.55),
+                QPointF(mx - ux * size * 0.6 - nx * size * 0.55,
+                        my - uy * size * 0.6 - ny * size * 0.55),
+            ])
+            arrow = QGraphicsPolygonItem(triangle)
+            arrow.setPen(QPen(QColor("#f0b64f" if reverse else self.active_path.color), 0))
+            arrow.setBrush(QBrush(QColor("#f0b64f" if reverse else self.active_path.color)))
+            arrow.setZValue(101)
+            arrow.setToolTip("Reverse travel" if reverse else "Forward travel")
+            self.view.scene.addItem(arrow)
+            self.route_items.append(arrow)
 
     def _move_waypoint(self, index: int, x: float, y: float, live: bool) -> None:
         if not 0 <= index < len(self.route_points):
@@ -2385,7 +2437,8 @@ class MainWindow(QMainWindow):
             last_x, last_y = self.route_points[-1]
             path.moveTo(last_x, -last_y)
             path.lineTo(x, -y)
-            pen = QPen(QColor("#9eaaa6"))
+            next_reverse = bool(self.active_path.settings and self.active_path.settings.reverse)
+            pen = QPen(QColor("#f0b64f" if next_reverse else "#9eaaa6"))
             pen.setCosmetic(True)
             pen.setWidthF(1.4)
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -2460,7 +2513,12 @@ class MainWindow(QMainWindow):
             return
         scale = self.units_spin.value()
         self._clear_envelope()
-        worker = _PreviewWorker(token, route, geometry, self._settings(), scale, fast_preview)
+        directions = list(self.active_path.reverse_segments)
+        if len(route) > len(self.route_points):
+            directions.append(bool(self.active_path.settings and self.active_path.settings.reverse))
+        worker = _PreviewWorker(
+            token, route, geometry, self._settings(), scale, fast_preview, directions
+        )
         worker.signals.finished.connect(self._preview_completed)
         self._preview_running = True
         self._update_export_state()
@@ -2522,9 +2580,17 @@ class MainWindow(QMainWindow):
                 )
                 self._preview_validity = "valid" if reachable else "invalid"
                 state = "" if reachable else " · candidate exceeds steering/path limits"
+                route_gears = list(self.active_path.reverse_segments)
+                if self.view.drawing_mode:
+                    route_gears.append(bool(self.active_path.settings and self.active_path.settings.reverse))
+                gear_label = (
+                    "Mixed travel directions" if len(set(route_gears)) > 1
+                    else "Reverse" if route_gears and route_gears[0]
+                    else "Forward"
+                )
                 self.status.showMessage(
                     f"{'Fast live preview' if self._preview_fast else 'Detailed preview'} · {geometry.name} · "
-                    f"{'Reverse' if self.active_path.settings and self.active_path.settings.reverse else 'Forward'} · "
+                    f"{gear_label} · "
                     f"max wheel steer {max_wheel_steer:.1f}° (centre {max_steer:.1f}°) · "
                     f"axle off-tracking {max_offtracking:.2f} m · "
                     f"articulation {result.maximum_articulation_deg:.1f}° · "
@@ -2825,7 +2891,8 @@ class MainWindow(QMainWindow):
                 ):
                     settings = self._settings() if path_document is self.active_path else path_document.settings
                     path_document.simulation_result, path_document.envelope_geometry = calculate_path(
-                        path_document.points, geometry, settings, self.units_spin.value(), False
+                        path_document.points, geometry, settings, self.units_spin.value(), False,
+                        path_document.reverse_segments,
                     )
                     path_document.simulation_scale = self.units_spin.value()
                     path_document.detailed = True
@@ -2883,6 +2950,33 @@ class MainWindow(QMainWindow):
         for x, y in path_document.points:
             modelspace.add_circle(
                 (x, y), radius=max(0.15 * scale, 0.05), dxfattribs={"layer": node_layer}
+            )
+        direction_layers = {False: f"{prefix}_DIRECTION_FORWARD", True: f"{prefix}_DIRECTION_REVERSE"}
+        ensure_layer(direction_layers[False], 4)
+        ensure_layer(direction_layers[True], 30)
+        for segment_index, (start, end) in enumerate(zip(path_document.points, path_document.points[1:])):
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = math.hypot(dx, dy)
+            if length <= 1e-9:
+                continue
+            gear_reverse = (
+                path_document.reverse_segments[segment_index]
+                if segment_index < len(path_document.reverse_segments)
+                else bool(path_document.settings and path_document.settings.reverse)
+            )
+            ux, uy = dx / length, dy / length
+            nx, ny = -uy, ux
+            size = min(length * 0.16, max(0.6 * scale, length * 0.04))
+            midpoint = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            tip = (midpoint[0] + ux * size, midpoint[1] + uy * size)
+            back = (midpoint[0] - ux * size * 0.6, midpoint[1] - uy * size * 0.6)
+            modelspace.add_solid(
+                (tip[0] * scale, tip[1] * scale),
+                ((back[0] + nx * size * 0.55) * scale,
+                 (back[1] + ny * size * 0.55) * scale),
+                ((back[0] - nx * size * 0.55) * scale,
+                 (back[1] - ny * size * 0.55) * scale),
+                dxfattribs={"layer": direction_layers[gear_reverse]},
             )
 
         if path_document.envelope_geometry is not None:

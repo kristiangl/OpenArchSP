@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openarch-swept-paths"
-version = "0.2.2"
+version = "0.2.3"
 description = "Standalone Australian vehicle swept path analysis for CAD drawings"
 readme = "README.md"
 requires-python = ">=3.11"

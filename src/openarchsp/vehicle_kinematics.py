@@ -565,6 +565,7 @@ def simulate_combination(
     integration_step_s: float = 0.05,
     envelope_pose_stride: int = 1,
     reverse: bool = False,
+    reverse_segments: Sequence[bool] | None = None,
     dry_steering: bool = False,
     max_poses: int = 60_000,
 ) -> SimulationResult:
@@ -586,6 +587,35 @@ def simulate_combination(
     if len(target_samples) > max_poses:
         raise ValueError("This path exceeds the simulation pose limit; increase sampling spacing.")
     projection_segments = _prepare_path_projection(target_samples)
+    if reverse_segments is None:
+        reverse_segments = [reverse] * (len(route) - 1)
+    if len(reverse_segments) != len(route) - 1:
+        raise ValueError("Travel directions must be provided for each route segment.")
+    if not all(isinstance(value, bool) for value in reverse_segments):
+        raise ValueError("Route segment directions must be boolean values.")
+
+    # Associate smoothed target samples with their source polyline leg. The
+    # smoothing algorithm rounds corners, so use a forward-only nearest-leg
+    # search to keep gear changes attached to the waypoint where they were set.
+    route_segments = list(zip(route, route[1:]))
+    target_route_segments: list[int] = []
+    source_cursor = 0
+    for sample in target_samples:
+        stop = min(len(route_segments), source_cursor + 4)
+        best_leg, best_distance = source_cursor, math.inf
+        for leg_index in range(source_cursor, stop):
+            start, end = route_segments[leg_index]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length_squared = dx * dx + dy * dy
+            fraction = 0.0 if length_squared <= 1e-15 else min(
+                1.0, max(0.0, ((sample.point[0] - start[0]) * dx
+                               + (sample.point[1] - start[1]) * dy) / length_squared)
+            )
+            error = math.dist(sample.point, (start[0] + fraction * dx, start[1] + fraction * dy))
+            if error < best_distance:
+                best_leg, best_distance = leg_index, error
+        source_cursor = best_leg
+        target_route_segments.append(best_leg)
 
     lead = geometry.units[0]
     speed = speed_kmh / 3.6
@@ -596,8 +626,9 @@ def simulate_combination(
     target_distances = [sample.distance_m for sample in target_samples]
     total_target_length = target_distances[-1]
 
-    direction_sign = -1.0 if reverse else 1.0
-    heading = target_samples[0].heading_rad + (math.pi if reverse else 0.0)
+    initial_reverse = reverse_segments[0]
+    direction_sign = -1.0 if initial_reverse else 1.0
+    heading = target_samples[0].heading_rad + (math.pi if initial_reverse else 0.0)
     steering_angle = 0.0
     rear_axle = _sub(target_samples[0].point, _scale(_unit(heading), geometry.steer_axle_m))
     lead_poses: list[tuple[Point, float]] = [(rear_axle, heading)]
@@ -618,6 +649,9 @@ def simulate_combination(
             front, target_samples, path_segment, projection_segments
         )
         progress = max(progress, projected_s)
+        sample_segment = min(path_segment, len(target_route_segments) - 1)
+        segment_reverse = reverse_segments[target_route_segments[sample_segment]]
+        direction_sign = -1.0 if segment_reverse else 1.0
         maximum_path_error = max(maximum_path_error, path_error)
         distance_to_end = math.dist(front, target_samples[-1].point)
         if progress >= total_target_length - spacing_m and distance_to_end <= max(0.5, 2 * spacing_m):
@@ -628,11 +662,11 @@ def simulate_combination(
         aim = _point_at_distance(target_s, target_samples, target_distances)
         chord = _sub(aim, front)
         chord_length = max(math.hypot(*chord), 0.1)
-        front_course = heading + steering_angle + (math.pi if reverse else 0.0)
+        front_course = heading + steering_angle + (math.pi if segment_reverse else 0.0)
         aim_angle = math.atan2(chord[1], chord[0])
         heading_error = _wrap_angle(aim_angle - front_course)
         desired_curvature = 2 * math.sin(heading_error) / chord_length
-        if reverse:
+        if segment_reverse:
             desired_steering = math.atan(-geometry.steer_axle_m * desired_curvature)
             steering_rate = (desired_steering - steering_angle) / dt
         else:

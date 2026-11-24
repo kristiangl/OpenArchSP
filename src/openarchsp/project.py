@@ -36,6 +36,8 @@ class SweptPathDocument:
     vehicle_id: str
     color: str
     points: list[tuple[float, float]]
+    # Travel gear for each leg from point i to point i + 1.
+    reverse_segments: list[bool] = field(default_factory=list)
     simulation_result: SimulationResult | None = None
     envelope_geometry: object | None = None
     simulation_scale: float = 1.0
@@ -45,7 +47,8 @@ class SweptPathDocument:
     clearance_summary: dict | None = None
 
 
-def calculate_path(route, geometry, settings: PathSettings, units: float, fast: bool):
+def calculate_path(route, geometry, settings: PathSettings, units: float, fast: bool,
+                   reverse_segments=None):
     if geometry is None:
         return None, swept_footprint(route, settings.length * units, settings.width * units,
                                      max(0.25 * units, 1e-6))
@@ -56,6 +59,7 @@ def calculate_path(route, geometry, settings: PathSettings, units: float, fast: 
         speed_kmh=settings.speed, lock_to_lock_s=settings.lock_to_lock,
         dry_steering=settings.dry_steering,
         reverse=settings.reverse,
+        reverse_segments=reverse_segments,
         integration_step_s=0.32 if fast else 0.05, envelope_pose_stride=4 if fast else 1,
     )
     return result, scale_geometry(result.envelope, xfact=units, yfact=units, origin=(0, 0))
@@ -76,7 +80,8 @@ def save_project(target: Path, background: Path, project: Project) -> None:
     paths = []
     for path in project.paths:
         paths.append(dict(id=path.id, name=path.name, vehicle_id=path.vehicle_id,
-                          color=path.color, points=path.points, stations=path.vehicle_stations,
+                          color=path.color, points=path.points,
+                          reverse_segments=path.reverse_segments, stations=path.vehicle_stations,
                           settings=asdict(path.settings), clearance_summary=path.clearance_summary))
     used = {path.vehicle_id for path in project.paths}
     manifest = dict(version=1, paths=paths, active_id=project.active_id, units=project.units,
@@ -112,6 +117,13 @@ def load_project(source: Path, background: Path) -> Project:
                 for k, v in entry["settings"].items()
             })
             points = [(float(x), float(y)) for x, y in entry["points"]]
+            reverse_segments = entry.get("reverse_segments")
+            if reverse_segments is None:
+                reverse_segments = [settings.reverse] * max(0, len(points) - 1)
+            if (not isinstance(reverse_segments, list)
+                    or len(reverse_segments) != max(0, len(points) - 1)
+                    or not all(isinstance(value, bool) for value in reverse_segments)):
+                raise ValueError("Invalid swept path travel directions.")
             stations = [float(value) for value in entry["stations"]]
             if (entry["vehicle_id"] not in vehicles
                     or not all(math.isfinite(v) for xy in points for v in xy)
@@ -125,7 +137,8 @@ def load_project(source: Path, background: Path) -> Project:
                 if not isinstance(entry[key], str) or not entry[key]:
                     raise ValueError("Invalid swept path details.")
             paths.append(SweptPathDocument(entry["id"], entry["name"], entry["vehicle_id"],
-                                           entry["color"], points, vehicle_stations=stations,
+                                           entry["color"], points, reverse_segments=reverse_segments,
+                                           vehicle_stations=stations,
                                            settings=settings, simulation_scale=units,
                                            clearance_summary=entry.get("clearance_summary")))
         ids = {path.id for path in paths}

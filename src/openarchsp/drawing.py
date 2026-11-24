@@ -142,7 +142,8 @@ def prepare_background(source: Path, directory: Path, progress: Callable[[str, i
             if len(path.points) >= 2 and (geometry or project.vehicles[path.vehicle_id].supports_preview):
                 try:
                     path.simulation_result, path.envelope_geometry = calculate_path(
-                        path.points, geometry, path.settings, project.units, False
+                        path.points, geometry, path.settings, project.units, False,
+                        path.reverse_segments,
                     )
                     path.detailed = True
                 except ValueError as error:

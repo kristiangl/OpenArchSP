@@ -15,6 +15,7 @@ class PathState:
     vehicle_id: str
     color: str
     points: tuple
+    reverse_segments: tuple
     stations: tuple
     settings: PathSettings
 
