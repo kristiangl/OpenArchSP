@@ -18,7 +18,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import ezdxf
-from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, QThreadPool, QTimer, QUrl, Qt, Signal
+from PySide6.QtCore import (
+    QObject, QPointF, QRunnable, QSettings, QSize, QThreadPool, QTimer, QUrl, Qt, Signal
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -29,7 +31,6 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPolygonF,
-    QPointF,
     QFont,
     QPen,
     QUndoStack,

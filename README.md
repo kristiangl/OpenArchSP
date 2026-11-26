@@ -12,7 +12,7 @@ Open the repository’s Actions page and choose the latest successful Build inst
 - **macOS Intel or Apple Silicon:** Open the matching disk image and drag the app into Applications. Builds are unsigned and not notarized, so macOS may require approval on first launch.
 - **Linux x86_64:** Make the AppImage executable and launch it. It is built on Ubuntu 22.04 and targets compatible glibc-based distributions.
 
-Actions artifacts are retained for 14 days. A matching version tag publishes permanent downloads under Releases. The current release is v0.2.3.
+Actions artifacts are retained for 14 days. A matching version tag publishes permanent downloads under Releases. The current release is v0.2.4.
 
 ## Current workflow
 
